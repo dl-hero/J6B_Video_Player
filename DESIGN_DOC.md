@@ -1,10 +1,29 @@
 # J6B Video Player — 架构设计文档与使用说明
 
-> **版本**: 1.1.0  
-> **日期**: 2025-06-26  
+> **版本**: 1.2.0  
+> **日期**: 2025-06-28  
 > **适用平台**: Windows 10+ / Ubuntu 22.04+  
 > **目标设备**: J6B (Horizon Robotics J6 芯片平台)  
+> **已验证设备**: J6B_GAC_AY5-TM (IP: 172.16.0.14, 5 路摄像头)  
 > **协议参考**: `hb_tool_server.h` / `hb_tool_server.c` / `camera_sample.c` / `socket_manager.c` / `server_cmd.h`
+
+---
+
+## 变更履历
+
+| 版本 | 日期 | 变更文件 | 变更说明 |
+|------|------|----------|----------|
+| 1.0.0 | 2025-06-25 | 全部 | 初始版本，基于 J6B SDK 协议逆向分析，实现单路视频接收与 GUI 显示 |
+| 1.1.0 | 2025-06-26 | `hb_protocol.py` | 完善协议常量注释，`parse_frame_info` 新增 `type_name` 字段 |
+| | | `hb_video_client.py` | 完善 `_recv_loop` 错误处理，`_sync_to_header` 增加滑动窗口防跨边界逻辑 |
+| | | `hb_video_gui.py` | 字体适配跨平台 (`Microsoft YaHei` → `DejaVu Sans`)，GUI 仅依赖 Pillow 不依赖 OpenCV |
+| | | `hb_video_cli.py` | 完善命令行参数解析，新增 `--no-display` 和 `--save-dir` 参数 |
+| | | `DESIGN_DOC.md` | 全面重写，精确行数、完整 API 表、性能数据、FAQ 扩展 |
+| **1.2.0** | **2025-06-28** | **`hb_video_gui.py`** | **重大更新**: 单路显示 → **多路视频支持**。新增通道下拉选择 (`pipe_combo`)、各通道概况面板 (`overview_text`)、`_pipe_frames` 多路帧缓冲字典、各路独立 FPS 统计、`_update_pipe_combo` 动态通道发现、`_on_pipe_selected` 通道切换事件 |
+| | | **`hb_video_cli.py`** | **重大更新**: 单路显示 → **多路视频支持**。新增 `--pipe` 参数指定单通道、`_show_grid` 多路 2×3 网格显示、各路独立帧计数 `_pipe_count`、自动通道发现 |
+| | | `hb_video_client.py` | 无变更 (核心通信层无需修改，协议层已支持多路) |
+| | | `hb_protocol.py` | 无变更 |
+| | | `DESIGN_DOC.md` | 新增多路视频架构、设备端已知限制、真机验证结果 (5 路)、GUI/CLI 多路使用说明 |
 
 ---
 
@@ -45,15 +64,16 @@ J6B 平台是地平线（Horizon Robotics）推出的智能驾驶芯片平台。
 | 功能 | 说明 |
 |------|------|
 | 远程视频流接收 | 通过以太网 TCP 连接 J6B 设备，实时接收 NV12 视频帧 |
-| 实时 GUI 显示 | 基于 tkinter + Pillow 的图形界面，支持画面缩放、FPS 叠加 |
-| 命令行模式 | 基于 OpenCV HighGUI 的命令行客户端，支持 `--no-display` 无头模式 |
-| NV12→BGR 转换 | 纯 numpy 向量化实现 ITU-R BT.601 标准的色彩空间转换，无需 OpenCV `cvtColor` |
+| **多路视频支持** | **自动识别 5 路视频通道 (同一 TCP 连接交错传输)，GUI 下拉切换/CLI 网格显示** |
+| 实时 GUI 显示 | 基于 tkinter + Pillow 的图形界面，支持画面缩放、FPS 叠加、通道概况面板 |
+| 命令行模式 | 基于 OpenCV HighGUI 的命令行客户端，支持 `--pipe` 单通道 + `--no-display` 无头模式 |
+| NV12→BGR 转换 | 纯 numpy 向量化实现 ITU-R BT.601 标准的色彩空间转换，支持 4K (3840×2160) |
 | 帧同步 | 魔数搜索自动对齐帧边界，支持中途连接和断线恢复 |
-| 截图保存 | GUI 和 CLI 均支持 JPG 格式截图，可自定义保存目录 |
+| 截图保存 | GUI 和 CLI 均支持 JPG 格式截图，自动标注 pipe 编号 |
 | 帧信息面板 | 实时显示帧类型、分辨率、帧序号、PIPE/CHN ID、数据长度等元数据 |
-| FPS 统计 | 1 秒滑动窗口实时帧率统计，在视频画布和标签栏双重显示 |
+| FPS 统计 | 各路独立 1 秒滑动窗口帧率统计，GUI 顶部显示总 FPS |
 | 连接状态管理 | 异步连接/断开，GUI 状态栏和日志面板双重反馈 |
-| 跨平台支持 | Windows 10+ 和 Ubuntu 22.04+ 均可运行，字体自动适配 |
+| 跨平台支持 | Windows 10+ 和 Ubuntu 22.04+ 均可运行，字体自动适配 (DejaVu Sans / Consolas) |
 
 ### 1.3 依赖
 
@@ -232,7 +252,9 @@ hb_video_cli.py ──────┘       │                      │
 >         ptr, size, ptr1, size1, ptr2, size2, ptr3, size3);
 > }
 > ```
-> 设备端还实现了负载均衡机制（`check_send_enable` → `send_data_load_balance`），在多个数据通道之间按优先级和输出计数动态调度，防止单个通道独占 TCP 发送缓冲区。
+> **多路视频传输**: 5 路视频通过**同一个 TCP 连接**交错传输，通过帧头中的 `pipe_id` 字段区分通道。设备端的负载均衡机制 (`send_data_load_balance`) 在 5 个通道之间按优先级和输出计数动态调度，防止单个通道独占 TCP 发送缓冲区。
+>
+> **已知限制**: 设备端 `hb_tool_server` 在每次设备启动后**仅接受一次 TCP 连接**。连接断开后端口即关闭，需要重启设备才能再次连接。这是设备端 SDK 的限制，PC 端代码无法绕过。建议在 GUI 中避免频繁断开/重连，尽量一次性完成调试操作，断开后通过 SSH 重启设备 (`ssh root@<IP> "reboot"`)。
 
 ### 3.2 帧头结构体 `cmd_header_new_t`（80 字节）
 
@@ -479,48 +501,47 @@ while self._running:
     └─ 10. _notify_frame(frame_info, bgr_image)
 ```
 
-### 4.3 `hb_video_gui.py` — GUI 界面层（461 行）
+### 4.3 `hb_video_gui.py` — GUI 界面层（v1.2.0 更新: 多路视频支持）
 
-**职责**: 提供 tkinter 图形界面，包含连接管理、视频渲染、信息显示、截图功能。**仅依赖 Pillow (PIL) 进行图像处理，不依赖 OpenCV**。
+**职责**: 提供 tkinter 图形界面，包含连接管理、**多路视频切换**、视频渲染、信息显示、截图功能。**仅依赖 Pillow (PIL) 进行图像处理，不依赖 OpenCV**。
 
 **核心类**: `HBVideoGUI`
 
-**内部状态**:
+**多路视频数据结构**:
 
 | 属性 | 类型 | 说明 |
 |------|------|------|
-| `client` | `HBVideoClient \| None` | 客户端实例 |
-| `_current_frame` | `np.ndarray \| None` | 当前帧 BGR 图像 (接收线程写入, GUI 线程读取, 有锁保护) |
-| `_current_info` | `dict \| None` | 当前帧信息字典 |
-| `_frame_lock` | `threading.Lock` | 帧缓冲区互斥锁 |
-| `_fps_value` | `float` | 平滑后的 FPS 值 |
-| `_snapshot_count` | `int` | 截图计数 (用于文件命名) |
-| `_snapshot_dir` | `str` | 截图保存目录 (默认 `./snapshots`) |
+| `_pipe_frames` | `dict[int, tuple[np.ndarray, dict]]` | **多路帧缓冲**: pipe_id → (bgr_image, frame_info) |
+| `_pipe_fps` | `dict[int, float]` | 各路独立 FPS 值 |
+| `_pipe_fps_count` | `dict[int, int]` | 各路 FPS 帧计数 |
+| `_available_pipes` | `list[int]` | 已发现的 pipe 列表 |
+| `_selected_pipe` | `int \| None` | 当前选中的 pipe (None = 全部模式) |
 
 **关键方法**:
 
 | 方法 | 说明 |
 |------|------|
 | `_build_ui()` | 构建完整 UI 布局 (控制面板 → 视频画布 + 信息面板 → 状态栏) |
-| `_build_control_panel(parent)` | 控制面板: IP 输入框、端口输入框、连接按钮、截图按钮、目录选择、FPS 标签 |
+| `_build_control_panel(parent)` | 控制面板: IP 输入框、端口输入框、连接按钮、**通道下拉选择**、截图按钮、目录选择、FPS 标签 |
 | `_build_video_panel(parent)` | 视频画布: 黑色背景 Canvas，显示 "等待连接..." 占位文字 |
-| `_build_info_panel(parent)` | 信息面板: 帧信息 Text (浅色背景) + 日志 Text (深色终端风格) + 滚动条 |
+| `_build_info_panel(parent)` | 信息面板: **各通道概况面板** + 当前帧详情 + 日志 (深色终端风格) + 滚动条 |
 | `_build_status_bar(parent)` | 状态栏: 显示当前状态文字 |
 | `_toggle_connection()` | 连接/断开切换入口 |
 | `_connect()` | 在后台线程中创建 `HBVideoClient` 并调用 `start()`，通过 `root.after()` 切回主线程 |
 | `_on_connected(host, port)` | 连接成功回调: 更新按钮状态、启用截图、清除占位文字 |
 | `_on_connect_failed()` | 连接失败回调: 恢复按钮状态、弹窗提示 |
-| `_disconnect()` | 停止客户端、更新按钮状态、禁用截图、清除画面 |
-| `_on_frame_received(info, img)` | **帧回调 (接收线程)**: 深拷贝帧到 `_current_frame`/`_current_info`，累计 FPS |
-| `_update_display()` | **30ms 定时器 (主线程)**: 从共享缓冲区取帧，调用 `_render_frame()` |
-| `_render_frame(img, info)` | **渲染管线**: BGR→RGB→PIL.Image→`resize(LANCZOS)`→`ImageTk.PhotoImage`→Canvas 居中显示 + FPS 叠加 |
-| `_update_info_panel(info)` | 更新帧信息 Text 组件 (9 行信息) |
-| `_save_snapshot()` | 当前帧保存为 JPG (通过 PIL)，命名格式 `snapshot_YYYYMMDD_HHMMSS_序号.jpg` |
+| `_disconnect()` | 停止客户端、更新按钮状态、禁用截图、**清空 pipe 帧缓冲和下拉列表** |
+| `_on_pipe_selected(event)` | **通道切换事件**: 从下拉列表选择指定 pipe 或 "全部" 模式 |
+| `_update_pipe_combo()` | **动态更新通道下拉列表**: 自动发现新 pipe 并添加到 Combobox |
+| `_on_frame_received(info, img)` | **帧回调 (接收线程)**: 按 pipe_id 分路存储到 `_pipe_frames`，各路独立 FPS 统计 |
+| `_update_display()` | **30ms 定时器 (主线程)**: 更新下拉列表 → 根据 `_selected_pipe` 选择帧 → 渲染 |
+| `_render_frame(img, info, pipe_id)` | **渲染管线**: BGR→RGB→PIL.Image→`resize(LANCZOS)`→`ImageTk.PhotoImage`→Canvas 居中 + Pipe/FPS 叠加 |
+| `_update_info_panel(info, pipe_id)` | 更新当前帧详情 Text 组件 (10 行信息，含通道号和 FPS) |
+| `_update_overview_panel()` | **更新各通道概况面板**: 显示所有 pipe 的分辨率、FPS、帧序号 |
+| `_save_snapshot()` | 当前帧保存为 JPG (通过 PIL)，**自动标注 pipe 编号** |
 | `_select_snapshot_dir()` | 打开目录选择对话框 |
 | `_log(message)` | 日志面板追加带时间戳的消息 |
 | `_on_close()` | 窗口关闭处理: 连接中则弹窗确认 |
-
-**字体适配**: 代码使用 `"DejaVu Sans"`（Ubuntu 默认安装）和 `"Consolas"`（跨平台等宽字体），在 Windows 和 Linux 上均可正常显示。
 
 ### 4.4 `hb_video_cli.py` — 命令行界面（179 行）
 
