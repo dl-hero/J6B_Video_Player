@@ -13,6 +13,7 @@ hb_video_gui.py - J6B 视频流 GUI 显示 (多路视频支持)
 依赖:
   pip install numpy pillow
   (tkinter 为 Python 标准库, 无需额外安装)
+  
 """
 
 import os
