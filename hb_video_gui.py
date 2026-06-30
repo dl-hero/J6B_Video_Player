@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-hb_video_gui.py - J6B 视频流 GUI 显示 (多路视频支持)
+hb_video_gui.py - J6B 视频流 GUI 显示 (多路视频田字格同时显示)
 
 功能:
   - 连接管理 (IP/端口输入)
-  - 多路视频自动识别与切换 (下拉选择 pipe)
-  - 实时视频显示 (单路大画面)
+  - 多路视频自动识别，田字格同时显示所有通道
+  - 每路视频上部叠加显示视频信息
   - 各路 FPS 独立统计
   - 帧信息面板
   - 截图保存
@@ -13,7 +13,7 @@ hb_video_gui.py - J6B 视频流 GUI 显示 (多路视频支持)
 依赖:
   pip install numpy pillow
   (tkinter 为 Python 标准库, 无需额外安装)
-  
+
 """
 
 import os
@@ -32,7 +32,7 @@ from hb_protocol import DEFAULT_PORT
 
 
 class HBVideoGUI:
-    """J6B 多路视频流 GUI 客户端."""
+    """J6B 多路视频流 GUI 客户端 (田字格多路同时显示)."""
 
     def __init__(self):
         self.root = tk.Tk()
@@ -53,7 +53,7 @@ class HBVideoGUI:
         self._pipe_fps_count: dict[int, int] = defaultdict(int)
         self._fps_start_time = time.time()
 
-        # 当前选中的 pipe
+        # 当前选中的 pipe (用于截图 + 右侧详情面板)
         self._selected_pipe: int | None = None
         self._available_pipes: list[int] = []
 
@@ -112,7 +112,7 @@ class HBVideoGUI:
 
         ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
-        # 通道选择
+        # 通道选择 (用于截图 + 右侧详情面板，不影响田字格显示)
         ttk.Label(row1, text="通道:").pack(side=tk.LEFT, padx=2)
         self.pipe_combo = ttk.Combobox(row1, values=[], state="readonly", width=8)
         self.pipe_combo.pack(side=tk.LEFT, padx=2)
@@ -134,21 +134,24 @@ class HBVideoGUI:
         self.fps_label.pack(side=tk.RIGHT, padx=10)
 
     def _build_video_panel(self, parent):
-        """构建视频显示面板."""
+        """构建视频显示面板 (多路田字格)."""
         self.video_frame = ttk.LabelFrame(parent, text="视频画面", padding=2)
         self.video_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
 
-        self.video_canvas = tk.Canvas(
-            self.video_frame, bg="black", highlightthickness=0
-        )
-        self.video_canvas.pack(fill=tk.BOTH, expand=True)
+        # 网格容器 (动态行列)
+        self.grid_container = tk.Frame(self.video_frame, bg="#1a1a1a")
+        self.grid_container.pack(fill=tk.BOTH, expand=True)
 
-        self.no_signal_text = self.video_canvas.create_text(
-            400, 300, text="等待连接...\n请输入设备 IP 并点击「连接」",
-            fill="gray", font=("DejaVu Sans", 14), justify=tk.CENTER
-        )
+        # 各通道显示单元: pipe_id -> {"frame": tk.Frame, "canvas": tk.Canvas, "photo": ImageTk.PhotoImage}
+        self._pipe_cells: dict[int, dict] = {}
 
-        self._photo_image: ImageTk.PhotoImage | None = None
+        # 无信号提示
+        self.no_signal_label = tk.Label(
+            self.grid_container, text="等待连接...\n请输入设备 IP 并点击「连接」",
+            font=("DejaVu Sans", 14), fg="gray", bg="#1a1a1a",
+            justify=tk.CENTER
+        )
+        self.no_signal_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
     def _build_info_panel(self, parent):
         """构建信息面板."""
@@ -206,6 +209,80 @@ class HBVideoGUI:
         status_bar.pack(fill=tk.X)
 
     # ------------------------------------------------------------------
+    # 田字格布局计算
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _calculate_grid(count: int) -> tuple[int, int]:
+        """
+        根据通道数计算最佳田字格行列数.
+
+        规则: cols = ceil(sqrt(count)), rows = ceil(count / cols)
+          - 1 路 → 1×1
+          - 2 路 → 1×2
+          - 3~4 路 → 2×2
+          - 5~6 路 → 2×3
+          - 7~9 路 → 3×3
+        """
+        if count <= 0:
+            return 1, 1
+        cols = int(count ** 0.5 + 0.9999)       # ceil(sqrt)
+        rows = (count + cols - 1) // cols         # ceil(count / cols)
+        return rows, cols
+
+    def _arrange_grid(self):
+        """按当前活跃通道数重排田字格布局."""
+        pipes = sorted(self._pipe_cells.keys())
+        count = len(pipes)
+        if count == 0:
+            return
+
+        rows, cols = self._calculate_grid(count)
+
+        # 配置行列权重 (等比例伸缩)
+        for r in range(rows):
+            self.grid_container.grid_rowconfigure(r, weight=1, uniform="cell")
+        for c in range(cols):
+            self.grid_container.grid_columnconfigure(c, weight=1, uniform="cell")
+
+        # 放置各通道单元
+        for i, pipe_id in enumerate(pipes):
+            r, c = divmod(i, cols)
+            cell = self._pipe_cells[pipe_id]
+            cell["frame"].grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
+
+    def _get_or_create_cell(self, pipe_id: int) -> dict:
+        """获取或创建指定通道的显示单元."""
+        if pipe_id in self._pipe_cells:
+            return self._pipe_cells[pipe_id]
+
+        # 隐藏无信号提示
+        self.no_signal_label.place_forget()
+
+        # 外层容器 (带细边框)
+        cell_frame = tk.Frame(
+            self.grid_container, bg="#2a2a2a",
+            highlightbackground="#444", highlightthickness=1
+        )
+
+        # 视频 Canvas
+        canvas = tk.Canvas(cell_frame, bg="black", highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        cell = {"frame": cell_frame, "canvas": canvas, "photo": None}
+        self._pipe_cells[pipe_id] = cell
+
+        self._arrange_grid()
+        return cell
+
+    def _destroy_all_cells(self):
+        """销毁所有网格单元，恢复无信号提示."""
+        for cell in self._pipe_cells.values():
+            cell["frame"].destroy()
+        self._pipe_cells.clear()
+        self.no_signal_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
+    # ------------------------------------------------------------------
     # 连接管理
     # ------------------------------------------------------------------
 
@@ -252,8 +329,6 @@ class HBVideoGUI:
         self._log(f"✓ 已连接到 {host}:{port}")
         self._log("等待视频流数据...")
 
-        self.video_canvas.delete(self.no_signal_text)
-
     def _on_connect_failed(self):
         """连接失败回调 (主线程)."""
         self.connect_btn.config(state=tk.NORMAL, text="连接")
@@ -282,18 +357,14 @@ class HBVideoGUI:
         self.pipe_combo["values"] = []
         self.pipe_combo.set("全部")
 
-        self.video_canvas.delete("all")
-        self.no_signal_text = self.video_canvas.create_text(
-            400, 300, text="已断开\n点击「连接」重新开始",
-            fill="gray", font=("DejaVu Sans", 14), justify=tk.CENTER
-        )
+        self._destroy_all_cells()
 
     # ------------------------------------------------------------------
     # 通道选择
     # ------------------------------------------------------------------
 
     def _on_pipe_selected(self, event=None):
-        """通道下拉选择事件."""
+        """通道下拉选择事件 (仅影响截图目标 + 右侧详情面板)."""
         value = self.pipe_combo.get()
         if value == "全部":
             self._selected_pipe = None
@@ -363,41 +434,44 @@ class HBVideoGUI:
     # ------------------------------------------------------------------
 
     def _update_display(self):
-        """定时刷新画面 (30ms)."""
-        # 更新通道下拉列表
+        """定时刷新所有通道画面 (30ms)."""
         self._update_pipe_combo()
 
-        # 获取要显示的帧
-        frame = None
-        info = None
-        pipe_id = None
-
+        # 获取所有通道的最新帧快照 (在锁内批量拷贝)
+        frames_snapshot: dict[int, tuple[np.ndarray, dict]] = {}
         with self._frame_lock:
-            if self._selected_pipe is not None:
-                # 显示指定通道
-                if self._selected_pipe in self._pipe_frames:
-                    frame, info = self._pipe_frames[self._selected_pipe]
-                    frame = frame.copy()
-                    info = dict(info) if info else None
-                    pipe_id = self._selected_pipe
-            elif self._pipe_frames:
-                # "全部" 模式: 显示最新收到的帧
-                pipe_id = max(self._pipe_frames.keys(),
-                              key=lambda p: self._pipe_frames[p][1].get('frame_id', 0))
-                frame, info = self._pipe_frames[pipe_id]
-                frame = frame.copy()
-                info = dict(info) if info else None
+            for pid in list(self._pipe_frames.keys()):
+                frame, info = self._pipe_frames[pid]
+                frames_snapshot[pid] = (frame.copy(), dict(info))
 
-        if frame is not None:
-            self._render_frame(frame, info, pipe_id)
+        # 确保所有活跃通道有对应显示单元
+        for pid in frames_snapshot:
+            self._get_or_create_cell(pid)
 
+        # 渲染每个通道
+        for pid, (frame, info) in frames_snapshot.items():
+            if pid in self._pipe_cells:
+                self._render_cell(pid, frame, info)
+
+        # 更新右侧面板
         self._update_overview_panel()
+        self._update_info_panel_for_selected(frames_snapshot)
+
+        # 更新 FPS 标签
+        total_fps = sum(self._pipe_fps.values())
+        self.fps_label.config(
+            text=f"总FPS: {total_fps:.1f}" if total_fps > 0 else "FPS: --"
+        )
+
         self.root.after(30, self._update_display)
 
-    def _render_frame(self, bgr_image: np.ndarray, frame_info: dict | None, pipe_id: int):
-        """渲染帧到画布."""
-        canvas_w = self.video_canvas.winfo_width()
-        canvas_h = self.video_canvas.winfo_height()
+    def _render_cell(self, pipe_id: int, bgr_image: np.ndarray, frame_info: dict):
+        """渲染单路视频到对应网格单元，上部叠加信息条."""
+        cell = self._pipe_cells[pipe_id]
+        canvas = cell["canvas"]
+
+        canvas_w = canvas.winfo_width()
+        canvas_h = canvas.winfo_height()
 
         if canvas_w < 10 or canvas_h < 10:
             return
@@ -406,51 +480,54 @@ class HBVideoGUI:
         if h == 0 or w == 0:
             return
 
-        # 计算缩放比例 (保持宽高比, 留边距给文字叠加)
-        margin = 40
-        scale = min((canvas_w - 20) / w, (canvas_h - margin) / h)
+        # 预留顶部信息条高度
+        info_h = 24
+
+        # 计算缩放比例 (保持宽高比，视频区域居中)
+        scale = min((canvas_w - 4) / w, (canvas_h - info_h - 4) / h)
         new_w, new_h = int(w * scale), int(h * scale)
 
-        # BGR -> RGB -> PIL -> ImageTk
+        # BGR → RGB → PIL → ImageTk
         rgb = bgr_image[..., ::-1]
         pil_img = Image.fromarray(rgb)
         pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
 
-        self._photo_image = ImageTk.PhotoImage(pil_img)
+        cell["photo"] = ImageTk.PhotoImage(pil_img)
 
+        # 居中绘制视频画面
         x = (canvas_w - new_w) // 2
-        y = (canvas_h - new_h) // 2
+        y = info_h + (canvas_h - info_h - new_h) // 2
 
-        self.video_canvas.delete("all")
-        self.video_canvas.create_image(x, y, anchor=tk.NW, image=self._photo_image)
+        canvas.delete("all")
 
-        # 叠加信息
+        # 顶部信息条背景 (黑色半透明效果)
+        canvas.create_rectangle(0, 0, canvas_w, info_h, fill="black", outline="")
+
+        # 视频画面
+        canvas.create_image(x, y, anchor=tk.NW, image=cell["photo"])
+
+        # 叠加信息文字 (Pipe ID + 分辨率 + FPS + 帧序号)
         fps = self._pipe_fps.get(pipe_id, 0)
-        self.video_canvas.create_text(
-            10, 10, text=f"Pipe {pipe_id} | FPS: {fps:.1f}",
-            anchor=tk.NW, fill="lime", font=("Consolas", 12, "bold")
+        info_text = (
+            f"Pipe {pipe_id} | {frame_info['width']}×{frame_info['height']} | "
+            f"FPS {fps:.1f} | #{frame_info['frame_id']}"
         )
-        self.video_canvas.create_text(
-            10, 30, text=f"{frame_info['width']}×{frame_info['height']} | "
-                         f"Frame #{frame_info['frame_id']}",
-            anchor=tk.NW, fill="lime", font=("Consolas", 10)
-        )
-
-        # 更新 FPS 标签
-        total_fps = sum(self._pipe_fps.values())
-        self.fps_label.config(text=f"总FPS: {total_fps:.1f}")
-
-        # 更新状态栏
-        pipe_name = f"Pipe {pipe_id}" if self._selected_pipe else f"最新 Pipe {pipe_id}"
-        self.status_var.set(
-            f"已连接 | {pipe_name} | "
-            f"{frame_info['width']}×{frame_info['height']} | "
-            f"Frame #{frame_info['frame_id']}"
+        canvas.create_text(
+            4, 2, text=info_text,
+            anchor=tk.NW, fill="lime", font=("Consolas", 9)
         )
 
-        # 更新详情面板
-        if frame_info:
-            self._update_info_panel(frame_info, pipe_id)
+    def _update_info_panel_for_selected(self, frames_snapshot: dict):
+        """更新右侧详情面板 (显示选中通道或最后活跃通道)."""
+        pipe_id = self._selected_pipe
+        if pipe_id is not None and pipe_id in frames_snapshot:
+            _, info = frames_snapshot[pipe_id]
+            self._update_info_panel(info, pipe_id)
+        elif self._selected_pipe is None and frames_snapshot:
+            # "全部" 模式: 显示最后活跃通道
+            pipe_id = max(frames_snapshot.keys())
+            _, info = frames_snapshot[pipe_id]
+            self._update_info_panel(info, pipe_id)
 
     def _update_info_panel(self, frame_info: dict, pipe_id: int):
         """更新当前帧详情面板."""
@@ -473,6 +550,13 @@ class HBVideoGUI:
         self.info_text.delete("1.0", tk.END)
         self.info_text.insert("1.0", text)
         self.info_text.config(state=tk.DISABLED)
+
+        # 更新状态栏
+        self.status_var.set(
+            f"已连接 | Pipe {pipe_id} | "
+            f"{frame_info['width']}×{frame_info['height']} | "
+            f"Frame #{frame_info['frame_id']}"
+        )
 
     def _update_overview_panel(self):
         """更新各通道概况面板."""

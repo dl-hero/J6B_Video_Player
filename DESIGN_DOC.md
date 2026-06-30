@@ -1,7 +1,7 @@
 # J6B Video Player — 架构设计文档与使用说明
 
-> **版本**: 1.2.0  
-> **日期**: 2025-06-28  
+> **版本**: 1.3.0  
+> **日期**: 2025-06-29  
 > **适用平台**: Windows 10+ / Ubuntu 22.04+  
 > **目标设备**: J6B (Horizon Robotics J6 芯片平台)  
 > **已验证设备**: J6B_GAC_AY5-TM (IP: 172.16.0.14, 5 路摄像头)  
@@ -24,6 +24,10 @@
 | | | `hb_video_client.py` | 无变更 (核心通信层无需修改，协议层已支持多路) |
 | | | `hb_protocol.py` | 无变更 |
 | | | `DESIGN_DOC.md` | 新增多路视频架构、设备端已知限制、真机验证结果 (5 路)、GUI/CLI 多路使用说明 |
+| **1.3.0** | **2025-06-29** | **`hb_video_gui.py`** | **重大更新**: 多路视频田字格同时显示。移除单路大画面切换模式，改为所有通道按田字格同时渲染。新增 `_calculate_grid()` 自适应行列数 (ceil(sqrt(N)))、`_pipe_cells` 网格单元字典、`_get_or_create_cell()` 动态创建显示单元、`_render_cell()` 各通道独立渲染 + 顶部信息条叠加、`_arrange_grid()` 自动网格布局。通道下拉框改为仅控制截图目标 + 右侧详情面板，不影响田字格全量显示。 |
+| | | `hb_video_client.py` | 无变更 |
+| | | `hb_protocol.py` | 无变更 |
+| | | `DESIGN_DOC.md` | 更新 GUI 架构设计、组件树、渲染管线、数据流以反映田字格多路同时显示 |
 
 ---
 
@@ -64,7 +68,7 @@ J6B 平台是地平线（Horizon Robotics）推出的智能驾驶芯片平台。
 | 功能 | 说明 |
 |------|------|
 | 远程视频流接收 | 通过以太网 TCP 连接 J6B 设备，实时接收 NV12 视频帧 |
-| **多路视频支持** | **自动识别 5 路视频通道 (同一 TCP 连接交错传输)，GUI 下拉切换/CLI 网格显示** |
+| **多路视频支持** | **自动识别多路视频通道 (同一 TCP 连接交错传输)，田字格同时显示所有通道，自适应行列数** |
 | 实时 GUI 显示 | 基于 tkinter + Pillow 的图形界面，支持画面缩放、FPS 叠加、通道概况面板 |
 | 命令行模式 | 基于 OpenCV HighGUI 的命令行客户端，支持 `--pipe` 单通道 + `--no-display` 无头模式 |
 | NV12→BGR 转换 | 纯 numpy 向量化实现 ITU-R BT.601 标准的色彩空间转换，支持 4K (3840×2160) |
@@ -501,9 +505,9 @@ while self._running:
     └─ 10. _notify_frame(frame_info, bgr_image)
 ```
 
-### 4.3 `hb_video_gui.py` — GUI 界面层（v1.2.0 更新: 多路视频支持）
+### 4.3 `hb_video_gui.py` — GUI 界面层（v1.3.0 更新: 田字格多路同时显示）
 
-**职责**: 提供 tkinter 图形界面，包含连接管理、**多路视频切换**、视频渲染、信息显示、截图功能。**仅依赖 Pillow (PIL) 进行图像处理，不依赖 OpenCV**。
+**职责**: 提供 tkinter 图形界面，包含连接管理、**多路视频田字格同时显示**、视频渲染、信息显示、截图功能。**仅依赖 Pillow (PIL) 进行图像处理，不依赖 OpenCV**。
 
 **核心类**: `HBVideoGUI`
 
@@ -515,27 +519,45 @@ while self._running:
 | `_pipe_fps` | `dict[int, float]` | 各路独立 FPS 值 |
 | `_pipe_fps_count` | `dict[int, int]` | 各路 FPS 帧计数 |
 | `_available_pipes` | `list[int]` | 已发现的 pipe 列表 |
-| `_selected_pipe` | `int \| None` | 当前选中的 pipe (None = 全部模式) |
+| `_selected_pipe` | `int \| None` | 当前选中的 pipe (None = 全部模式，仅影响截图目标 + 详情面板) |
+| `_pipe_cells` | `dict[int, dict]` | **田字格显示单元**: pipe_id → `{"frame": tk.Frame, "canvas": tk.Canvas, "photo": ImageTk.PhotoImage}` |
+
+**田字格布局算法**:
+
+| 通道数 | 行列 | 网格 |
+|--------|------|------|
+| 1 | 1×1 | 单路全屏 |
+| 2 | 1×2 | 横向并排 |
+| 3~4 | 2×2 | 田字格 |
+| 5~6 | 2×3 | 两行三列 |
+| 7~9 | 3×3 | 三行三列 |
+
+> 计算公式: `cols = ceil(sqrt(N))`, `rows = ceil(N / cols)`。`_calculate_grid(count)` 静态方法实现。
 
 **关键方法**:
 
 | 方法 | 说明 |
 |------|------|
-| `_build_ui()` | 构建完整 UI 布局 (控制面板 → 视频画布 + 信息面板 → 状态栏) |
-| `_build_control_panel(parent)` | 控制面板: IP 输入框、端口输入框、连接按钮、**通道下拉选择**、截图按钮、目录选择、FPS 标签 |
-| `_build_video_panel(parent)` | 视频画布: 黑色背景 Canvas，显示 "等待连接..." 占位文字 |
+| `_build_ui()` | 构建完整 UI 布局 (控制面板 → 视频田字格容器 + 信息面板 → 状态栏) |
+| `_build_control_panel(parent)` | 控制面板: IP 输入框、端口输入框、连接按钮、**通道下拉选择 (截图目标 + 详情面板)**、截图按钮、目录选择、FPS 标签 |
+| `_build_video_panel(parent)` | 视频面板: `grid_container` 容器 (动态行列)，无信号时显示占位 Label |
 | `_build_info_panel(parent)` | 信息面板: **各通道概况面板** + 当前帧详情 + 日志 (深色终端风格) + 滚动条 |
 | `_build_status_bar(parent)` | 状态栏: 显示当前状态文字 |
+| `_calculate_grid(count)` | **静态方法**: 根据通道数计算最佳田字格行列数 (ceil(sqrt) 策略) |
+| `_arrange_grid()` | **动态重排网格**: 按活跃通道数配置 `grid_rowconfigure`/`grid_columnconfigure` 权重，等比例伸缩 |
+| `_get_or_create_cell(pipe_id)` | **获取或创建显示单元**: 首次出现时创建 `Frame + Canvas`，自动调用 `_arrange_grid()` |
+| `_destroy_all_cells()` | 断开时销毁所有网格单元，恢复无信号提示 |
 | `_toggle_connection()` | 连接/断开切换入口 |
 | `_connect()` | 在后台线程中创建 `HBVideoClient` 并调用 `start()`，通过 `root.after()` 切回主线程 |
-| `_on_connected(host, port)` | 连接成功回调: 更新按钮状态、启用截图、清除占位文字 |
+| `_on_connected(host, port)` | 连接成功回调: 更新按钮状态、启用截图 |
 | `_on_connect_failed()` | 连接失败回调: 恢复按钮状态、弹窗提示 |
-| `_disconnect()` | 停止客户端、更新按钮状态、禁用截图、**清空 pipe 帧缓冲和下拉列表** |
-| `_on_pipe_selected(event)` | **通道切换事件**: 从下拉列表选择指定 pipe 或 "全部" 模式 |
+| `_disconnect()` | 停止客户端、更新按钮状态、禁用截图、**清空 pipe 帧缓冲和下拉列表、销毁所有网格单元** |
+| `_on_pipe_selected(event)` | **通道选择事件** (仅影响截图目标 + 右侧详情面板，不影响田字格全量显示) |
 | `_update_pipe_combo()` | **动态更新通道下拉列表**: 自动发现新 pipe 并添加到 Combobox |
 | `_on_frame_received(info, img)` | **帧回调 (接收线程)**: 按 pipe_id 分路存储到 `_pipe_frames`，各路独立 FPS 统计 |
-| `_update_display()` | **30ms 定时器 (主线程)**: 更新下拉列表 → 根据 `_selected_pipe` 选择帧 → 渲染 |
-| `_render_frame(img, info, pipe_id)` | **渲染管线**: BGR→RGB→PIL.Image→`resize(LANCZOS)`→`ImageTk.PhotoImage`→Canvas 居中 + Pipe/FPS 叠加 |
+| `_update_display()` | **30ms 定时器 (主线程)**: 更新下拉列表 → 批量获取所有通道帧快照 → 为每个通道创建/获取显示单元 → 逐个渲染 |
+| `_render_cell(pipe_id, img, info)` | **单路渲染**: 计算缩放比例 → BGR→RGB→PIL.Image→`resize(LANCZOS)`→`ImageTk.PhotoImage`→Canvas 居中绘制 + 顶部 24px 黑色信息条叠加 (Pipe ID / 分辨率 / FPS / 帧序号) |
+| `_update_info_panel_for_selected(frames_snapshot)` | 更新右侧详情面板 (显示选中通道或最后活跃通道) |
 | `_update_info_panel(info, pipe_id)` | 更新当前帧详情 Text 组件 (10 行信息，含通道号和 FPS) |
 | `_update_overview_panel()` | **更新各通道概况面板**: 显示所有 pipe 的分辨率、FPS、帧序号 |
 | `_save_snapshot()` | 当前帧保存为 JPG (通过 PIL)，**自动标注 pipe 编号** |
@@ -602,7 +624,9 @@ while self._running:
 │  │  Main Thread (主线程 / GUI 线程)                               │   │
 │  │  - tkinter 事件循环 (root.mainloop)                            │   │
 │  │  - 30ms 定时器 _update_display()                              │   │
-│  │  - 从 _current_frame / _current_info 读取 (_frame_lock 保护)   │   │
+│  │  - 从 _pipe_frames 批量获取所有通道帧快照 (_frame_lock 保护)      │   │
+│  │  - 为每个通道创建/获取网格显示单元 (_get_or_create_cell)          │   │
+│  │  - 遍历 _pipe_cells 逐个渲染 (_render_cell)                      │   │
 │  │  - BGR→RGB→PIL.Image→ImageTk.PhotoImage→Canvas 渲染           │   │
 │  │  - 所有 tkinter 组件更新必须在此线程执行                         │   │
 │  └──────────────────────────────────────────────────────────────┘   │
@@ -709,7 +733,8 @@ frame_info + bgr_image
     ├──▶ _notify_frame() → 遍历回调列表
     │         │
     │         ├──▶ GUI 回调: _on_frame_received()
-    │         │         _frame_lock → _current_frame = copy() + _current_info = info
+    │         │         _frame_lock → _pipe_frames[pipe_id] = (bgr_image.copy(), info)
+    │         │         各路 FPS 统计更新
     │         │
     │         └──▶ CLI 回调: on_frame()
     │                   FPS 统计 → 终端打印 → cv2.imwrite (可选) → cv2.imshow (可选)
@@ -722,7 +747,7 @@ frame_info + bgr_image
 
 | 保护对象 | 锁 | 策略 |
 |----------|------|------|
-| `_current_frame` / `_current_info` | `_frame_lock` (GUI) | 接收线程写入时深拷贝 (`np.copy()`)，GUI 线程读取时再次深拷贝，双重隔离 |
+| `_pipe_frames` / `_available_pipes` | `_frame_lock` (GUI) | 接收线程写入时深拷贝 (`np.copy()`)，GUI 线程读取时再次深拷贝，双重隔离 |
 | `frame_count` / `error_count` | `_lock` (HBVideoClient) | 统计计数器，仅在 `_recv_loop` 和 `get_stats` 中访问 |
 | `_frame_callbacks` 列表 | 无锁 | 仅在连接前/断开后修改，接收期间只读遍历 |
 | Socket 操作 | 无锁 | 仅接收线程访问 socket，主线程通过 `_running` 标志和 `stop()` 间接控制 |
@@ -873,31 +898,45 @@ TCP 是**流式协议**，没有消息边界。当网络抖动导致丢包、PC 
 ### 8.1 组件树
 
 ```
-tk.Tk (root)  — 标题 "J6B Video Player - PC 客户端"
-│              默认大小 1280×800, 最小 960×600
+tk.Tk (root)  — 标题 "J6B Video Player - 多路视频客户端"
+│              默认大小 1400×900, 最小 1024×700
 └── ttk.Frame (main_frame, padding=4)
     │
     ├── ttk.LabelFrame "控制面板" (padding=6)
     │   └── ttk.Frame (row1)
     │       ├── ttk.Label "设备 IP:"
-    │       ├── ttk.Entry (ip_entry, width=16, default="192.168.1.100")
+    │       ├── ttk.Entry (ip_entry, width=16, default="172.16.0.14")
     │       ├── ttk.Label "端口:"
     │       ├── ttk.Entry (port_entry, width=8, default="10086")
     │       ├── ttk.Button "连接" (connect_btn) → _toggle_connection()
     │       ├── ttk.Separator (VERTICAL)
+    │       ├── ttk.Label "通道:"
+    │       ├── ttk.Combobox (pipe_combo, readonly, 截图目标 + 详情面板选择)
+    │       ├── ttk.Separator (VERTICAL)
     │       ├── ttk.Button "截图保存" (snapshot_btn, 初始 DISABLED) → _save_snapshot()
     │       ├── ttk.Button "选择保存目录" → _select_snapshot_dir()
-    │       └── ttk.Label "FPS: --" (fps_label, RIGHT 对齐)
+    │       └── ttk.Label "总FPS: --" (fps_label, RIGHT 对齐)
     │
     ├── ttk.Frame (content_frame)
     │   ├── ttk.LabelFrame "视频画面" (padding=2, LEFT, expand=True)
-    │   │   └── tk.Canvas (video_canvas, bg="black")
-    │   │       └── 初始: "等待连接...\n请输入设备 IP 并点击「连接」"
-    │   │          字体: "DejaVu Sans" 14, 灰色, 居中
+    │   │   └── tk.Frame (grid_container, bg="#1a1a1a")
+    │   │       ├── 无信号时: tk.Label "等待连接...\n请输入设备 IP 并点击「连接」"
+    │   │       │             字体: "DejaVu Sans" 14, 灰色, 居中
+    │   │       └── 有信号时: 动态田字格 (行列由 _calculate_grid 计算)
+    │   │           ├── tk.Frame (cell_frame, bg="#2a2a2a", highlightborder="#444")
+    │   │           │   └── tk.Canvas (bg="black", highlightthickness=0)
+    │   │           │       渲染: 视频画面居中 + 顶部 24px 黑色信息条
+    │   │           │       信息条: "Pipe N | W×H | FPS NN.N | #NNNNNN" (lime, Consolas 9)
+    │   │           ├── tk.Frame ... (通道 2)
+    │   │           └── tk.Frame ... (通道 N)
     │   │
-    │   └── ttk.LabelFrame "帧信息" (padding=6, width=260, RIGHT, fill=Y)
-    │       ├── tk.Text (info_text, DISABLED, 等宽 "Consolas" 10, 浅灰背景)
-    │       │   └── 9 行帧信息: 帧类型/格式/分辨率/步长/帧序号/PIPE/CHN/数据长度/版本
+    │   └── ttk.LabelFrame "通道信息" (padding=6, width=280, RIGHT, fill=Y)
+    │       ├── ttk.LabelFrame "各通道概况" (padding=4)
+    │       │   └── tk.Text (overview_text, DISABLED, "Consolas" 9, 浅灰背景)
+    │       │       └── 每行: "Pipe N: W×H | FPS NN.N | Frame #NNNNNN"
+    │       ├── ttk.LabelFrame "当前帧详情" (padding=4)
+    │       │   └── tk.Text (info_text, DISABLED, "Consolas" 10, 浅灰背景)
+    │       │       └── 10 行帧信息: 通道/FPS/帧类型/格式/分辨率/步长/帧序号/CHN/数据长度/版本
     │       └── ttk.LabelFrame "日志" (padding=4)
     │           └── tk.Text (log_text, DISABLED, "Consolas" 9, 深色终端风格)
     │               └── ttk.Scrollbar (垂直滚动条)
@@ -946,9 +985,9 @@ tk.Tk (root)  — 标题 "J6B Video Player - PC 客户端"
           │ 连接按钮: [断开] (启用)│      │ 连接按钮: [连接] (启用)│
           │ 截图按钮: 启用        │      │ 弹窗: 连接失败原因     │
           │ 状态: "已连接 IP:PORT"│      │ 状态: "连接失败"      │
-          │ 画布: 清除占位文字     │      │ 日志: "✗ 连接失败..." │
+          │ 网格: 自动创建田字格   │      │ 日志: "✗ 连接失败..." │
           │ 日志: "✓ 已连接"      │      └─────────────────────┘
-          │ 开始接收视频帧        │
+          │ 所有通道同时渲染      │
           └──────────┬──────────┘
                      │ 用户点击 [断开] 或 关闭窗口
                      ▼
@@ -960,56 +999,70 @@ tk.Tk (root)  — 标题 "J6B Video Player - PC 客户端"
           │ 连接按钮: [连接] (启用)│
           │ 截图按钮: 禁用        │
           │ 状态: "已断开"        │
-          │ 画布: "已断开\n点击...│
+          │ 网格: 销毁所有单元    │
           │ FPS: "--"            │
           └─────────────────────┘
 ```
 
-### 8.3 画面渲染管线
+### 8.3 画面渲染管线 (田字格多路模式)
 
 ```
 接收线程 (Recv Thread):
-    _current_frame = bgr_image.copy()    ← 深拷贝, _frame_lock 保护
-    _current_info = frame_info
+    _pipe_frames[pipe_id] = (bgr_image.copy(), frame_info)  ← 深拷贝, _frame_lock 保护
+    各路 FPS 统计更新
 
     ═══════════ 线程边界 ═══════════
 
 主线程 (Main Thread, 30ms 定时器):
     _update_display()
         │
-        _frame_lock.acquire()
-        frame = _current_frame.copy()    ← 再次深拷贝, 双重隔离
-        info = dict(_current_info)
-        _frame_lock.release()
+        ├── 1. _update_pipe_combo()  ← 动态更新下拉列表
         │
-        ▼
-    _render_frame(frame, info)
+        ├── 2. _frame_lock.acquire()
+        │   frames_snapshot = {pid: (frame.copy(), dict(info)) for pid in _pipe_frames}
+        │   _frame_lock.release()
         │
-        ├── 计算缩放比例:
-        │   scale = min(canvas_width / frame_width, canvas_height / frame_height)
-        │   new_w, new_h = int(w * scale), int(h * scale)
+        ├── 3. 为每个活跃通道创建/获取网格单元:
+        │   for pid in frames_snapshot:
+        │       self._get_or_create_cell(pid)  ← 首次出现时创建 Frame + Canvas + 自动排布网格
         │
-        ├── 色彩空间转换:
-        │   rgb = frame[..., ::-1]       ← BGR → RGB (NumPy slice, O(1))
+        ├── 4. 逐个渲染每个通道:
+        │   for pid, (frame, info) in frames_snapshot:
+        │       self._render_cell(pid, frame, info)
+        │           │
+        │           ├── 获取 cell = _pipe_cells[pid]
+        │           ├── 计算缩放比例:
+        │           │   info_h = 24  (顶部信息条高度)
+        │           │   scale = min((canvas_w - 4) / w, (canvas_h - info_h - 4) / h)
+        │           │   new_w, new_h = int(w * scale), int(h * scale)
+        │           │
+        │           ├── 色彩空间转换:
+        │           │   rgb = frame[..., ::-1]  ← BGR → RGB (NumPy slice, O(1))
+        │           │
+        │           ├── 转换为 PIL 图像 + 缩放:
+        │           │   pil_img = Image.fromarray(rgb).resize((new_w, new_h), Image.LANCZOS)
+        │           │
+        │           ├── 转换为 tkinter 可用格式:
+        │           │   cell["photo"] = ImageTk.PhotoImage(pil_img)
+        │           │
+        │           ├── Canvas 绘制:
+        │           │   canvas.delete("all")
+        │           │   canvas.create_rectangle(0, 0, canvas_w, info_h, fill="black")  ← 顶部信息条背景
+        │           │   canvas.create_image(x, y, anchor=NW, image=cell["photo"])       ← 居中绘制视频
+        │           │   canvas.create_text(4, 2, text=info_text, anchor=NW, fill="lime", font=("Consolas", 9))
+        │           │   ↑ 顶部信息条: "Pipe N | 1920×1080 | FPS 30.0 | #12345"
+        │           │
+        │           └── 更新标签:
+        │               fps_label.config(text="总FPS: NN.N")
         │
-        ├── 转换为 PIL 图像:
-        │   pil_img = Image.fromarray(rgb)
+        ├── 5. 更新右侧面板:
+        │   _update_overview_panel()           ← 各通道概况
+        │   _update_info_panel_for_selected()  ← 选中通道或最后活跃通道的详情
         │
-        ├── 高质量缩放:
-        │   pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
-        │
-        ├── 转换为 tkinter 可用格式:
-        │   self._photo_image = ImageTk.PhotoImage(pil_img)
-        │
-        ├── Canvas 绘制:
-        │   canvas.delete("all")
-        │   canvas.create_image(x, y, anchor=NW, image=photo_image)  ← 居中
-        │   canvas.create_text(10, 10, "FPS: 30.0", fill="lime")     ← 叠加
-        │
-        └── 更新标签:
-            fps_label.config(text="FPS: 30.0")
-            _update_info_panel(info)     ← 更新右侧帧信息面板
+        └── 6. root.after(30, _update_display)  ← 下次调度
 ```
+
+> **关键设计**: 通道下拉框在 v1.3.0 中改为仅控制截图目标 + 右侧详情面板选择，不影响田字格全量显示。所有活跃通道始终同时渲染。网格行列数随通道数自动变化 (1→1×1, 2→1×2, 3~4→2×2, 5~6→2×3, 7~9→3×3)。
 
 ---
 
@@ -1229,7 +1282,7 @@ logging.basicConfig(level=logging.WARNING)
 |------|------|------|------|
 | `hb_protocol.py` | 342 | 纯协议层 | 常量、枚举 (5 个类)、结构体布局、打包/解包/验证函数 (6 个) |
 | `hb_video_client.py` | 440 | 核心引擎层 | `HBVideoClient` 类: TCP 连接、帧接收、NV12→BGR、回调管理 |
-| `hb_video_gui.py` | 461 | GUI 界面层 | `HBVideoGUI` 类: tkinter 窗口、PIL 渲染、截图、信息面板 |
+| `hb_video_gui.py` | 474 | GUI 界面层 | `HBVideoGUI` 类: tkinter 窗口、田字格多路同时渲染、PIL 缩放、截图、信息面板 |
 | `hb_video_cli.py` | 179 | CLI 界面层 | `CLIVideoClient` 类: argparse 参数、OpenCV 显示、帧保存 |
 | `requirements.txt` | 2 | 依赖声明 | `numpy>=1.21.0`, `opencv-python>=4.5.0`, `Pillow>=9.0.0` |
 | `README.md` | — | 简要说明 | 项目简介、快速开始、协议概述 |
@@ -1328,7 +1381,7 @@ Camera_player/
 ### 11.6 扩展开发建议
 
 1. **支持 H.264/H.265 解码**: 在 `_recv_loop` 中识别 `VIDEO_DATA` (3) 类型，使用 PyAV/FFmpeg 进行硬件解码
-2. **多路视频同时显示**: 创建多个 `HBVideoClient` 实例，分别连接不同 pipeline 或设备
+2. **多路视频同时显示**: ✅ 已实现。田字格自动布局，所有活跃通道通过同一 TCP 连接交错接收后同时渲染，每路视频顶部叠加信息条。
 3. **录制功能**: 在帧回调中使用 `cv2.VideoWriter` 保存为 MP4 文件
 4. **AI 推理集成**: 在帧回调中将帧放入队列，由独立工作线程调用 ONNX Runtime / OpenCV DNN 进行目标检测
 5. **Web 远程监控**: 将 `HBVideoClient` 封装为 FastAPI 服务，通过 WebSocket 或 MJPEG 流推送到浏览器
