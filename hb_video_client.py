@@ -4,22 +4,25 @@ hb_video_client.py - J6B 视频流客户端 (网络通信层)
 
 功能:
   1. 通过 TCP 连接远端 J6B 设备 (默认端口 10086)
-  2. 发送 NET_SEND_CFG 配置包启用 YUV 视频流传输
-  3. 接收并解析 cmd_header_new_t + NV12 数据帧
-  4. 将 NV12 转换为 RGB/BGR 供 GUI 显示
+  2. 发送 NET_SEND_CFG 配置包启用视频流传输
+  3. 接收并解析 cmd_header_new_t + 数据帧, 自动识别:
+     - NV12 (YUV_DATA)    → _nv12_to_bgr()  纯 numpy 转换
+     - H.264 (VIDEO_DATA) → PyAV 硬件解码 → BGR
+  4. 将解码后的 BGR 图像通过回调通知上层
 
 协议说明:
-  每帧 = 80 字节帧头 (cmd_header_new_t) + NV12 图像数据 (Y plane + UV plane)
+  每帧 = 80 字节帧头 (cmd_header_new_t) + 数据体
 
   关键帧头字段:
     - header_start  : 0xCCDDEEFF  (魔数)
     - header_check1 : 0x6789ABCD  (魔数)
     - header_end    : 0xFFEEDDCC  (魔数)
     - len           : 数据体长度
-    - type          : 1 = YUV_DATA
-    - format        : 0 = YUVNV12
+    - type          : 1=YUV_DATA(NV12), 3=VIDEO_DATA(H.264)
+    - format        : 0=YUVNV12
     - width/height/stride : 图像尺寸信息
     - frame_id      : 帧序号
+    - code_type     : 编码类型 (0=H264, 1=H265)
 
 NV12 格式:
   Y plane:  width * height 字节 (亮度)
@@ -44,10 +47,18 @@ from hb_protocol import (
     DataType,
     IDX_HEADER_START, IDX_HEADER_CHECK1, IDX_HEADER_END,
     IDX_LEN, IDX_TYPE, IDX_FORMAT, IDX_WIDTH, IDX_HEIGHT, IDX_STRIDE,
-    IDX_PIPE_ID, IDX_CHN_ID, IDX_FRAME_ID,
+    IDX_PIPE_ID, IDX_CHN_ID, IDX_FRAME_ID, IDX_CODE_TYPE,
     unpack_cmd_header, verify_header, make_net_send_cfg_packet,
     parse_frame_info,
 )
+
+# PyAV 可选依赖 (仅 H.264 解码时需要)
+try:
+    import av
+    _HAS_PYAV = True
+except ImportError:
+    _HAS_PYAV = False
+    av = None
 
 logger = logging.getLogger("HBVideoClient")
 
@@ -56,7 +67,10 @@ class HBVideoClient:
     """
     J6B 视频流客户端.
 
-    通过 TCP 连接到设备端 hb_tool_server，接收 NV12 视频流并转换为 RGB 帧。
+    自动识别数据类型并解码:
+      - NV12 (YUV_DATA, type=1)   → 纯 numpy BT.601 转换
+      - H.264 (VIDEO_DATA, type=3) → PyAV 软件解码
+    两种模式统一输出 BGR 图像, 对上层 GUI/CLI 透明。
     """
 
     def __init__(self, host: str, port: int = DEFAULT_PORT,
@@ -91,6 +105,9 @@ class HBVideoClient:
         self.frame_count = 0
         self.error_count = 0
         self._lock = threading.Lock()
+
+        # H.264 解码器 (按 pipe_id 独立, 仅 VIDEO_DATA 时使用)
+        self._h264_decoders: dict[int, 'av.CodecContext'] = {}
 
     # ------------------------------------------------------------------
     # 连接管理
@@ -137,6 +154,8 @@ class HBVideoClient:
                 pass
             self._sock.close()
             self._sock = None
+        # 清理 H.264 解码器 (下次连接时重建)
+        self._h264_decoders.clear()
         logger.info("已断开连接")
 
     @property
@@ -225,8 +244,9 @@ class HBVideoClient:
             data_len = header_fields[IDX_LEN]
             data_type = header_fields[IDX_TYPE]
 
-            # 4. 跳过非 YUV/RAW 数据
-            if data_type not in (DataType.YUV_DATA, DataType.RAW_DATA):
+            # 4. 跳过非 YUV/RAW/VIDEO 数据
+            if data_type not in (DataType.YUV_DATA, DataType.RAW_DATA,
+                                  DataType.VIDEO_DATA):
                 # 读取并丢弃数据体
                 if data_len > 0:
                     self._recv_exact(data_len)
@@ -243,18 +263,26 @@ class HBVideoClient:
             # 6. 解析帧信息
             frame_info = parse_frame_info(header_fields)
 
-            # 7. NV12 -> BGR 转换
-            try:
-                bgr_image = self._nv12_to_bgr(
-                    body_data,
-                    frame_info['width'],
-                    frame_info['height'],
-                    frame_info['stride'],
-                )
-            except Exception as e:
-                logger.error(f"NV12转BGR失败: {e}")
-                self.error_count += 1
-                continue
+            # 7. 解码图像数据
+            if data_type == DataType.VIDEO_DATA:
+                # H.264 码流 → PyAV 解码
+                bgr_image = self._decode_h264(
+                    body_data, frame_info['pipe_id'], frame_info)
+                if bgr_image is None:
+                    continue  # 解码器尚需更多数据, 等待下一帧
+            else:
+                # NV12 → BGR 转换 (原有逻辑)
+                try:
+                    bgr_image = self._nv12_to_bgr(
+                        body_data,
+                        frame_info['width'],
+                        frame_info['height'],
+                        frame_info['stride'],
+                    )
+                except Exception as e:
+                    logger.error(f"NV12转BGR失败: {e}")
+                    self.error_count += 1
+                    continue
 
             # 8. 更新统计
             with self._lock:
@@ -332,6 +360,54 @@ class HBVideoClient:
 
         logger.warning("同步超时, 未找到有效帧头")
         return False
+
+    # ------------------------------------------------------------------
+    # H.264 解码
+    # ------------------------------------------------------------------
+
+    def _get_h264_decoder(self, pipe_id: int) -> 'av.CodecContext':
+        """获取或创建指定 pipe 的 H.264 解码器."""
+        if not _HAS_PYAV:
+            raise RuntimeError(
+                "接收到了 H.264 视频流, 但 PyAV 未安装。"
+                "请运行: pip install av"
+            )
+        if pipe_id not in self._h264_decoders:
+            codec = av.CodecContext.create('h264', 'r')
+            codec.thread_count = 1  # 低延迟: 关闭多线程帧缓冲
+            self._h264_decoders[pipe_id] = codec
+            logger.info(f"Pipe {pipe_id}: 已创建低延迟 H.264 解码器")
+        return self._h264_decoders[pipe_id]
+
+    def _decode_h264(self, data: bytes, pipe_id: int,
+                       frame_info: dict) -> np.ndarray | None:
+        """
+        将 H.264 AnnexB 码流解码为 BGR 图像.
+
+        PyAV 内部自动缓冲数据, 一次 parse+decode 可能输出 0 或 N 帧。
+        只返回当前解码出的最后一帧 (通常每次调用对应 1 帧)。
+
+        Args:
+            data:       H.264 AnnexB 码流数据
+            pipe_id:    Pipeline 编号
+            frame_info: 帧信息字典
+
+        Returns:
+            BGR 格式 numpy 数组, 或 None (解码器需要更多数据)
+        """
+        decoder = self._get_h264_decoder(pipe_id)
+
+        try:
+            # send raw packet directly (skip parse buffering)
+            packet = av.Packet(data)
+            frames = decoder.decode(packet)
+            bgr = None
+            for frame in frames:
+                bgr = frame.to_ndarray(format='bgr24')
+            return bgr
+        except Exception as e:
+            logger.error(f"Pipe {pipe_id}: H.264 解码失败: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # NV12 -> BGR 转换

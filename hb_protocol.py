@@ -28,7 +28,10 @@ TOOL_HEADER_CHECK2_N = 0x00000000
 TOOL_HEADER_END_N    = 0xFFEEDDCC
 
 # 芯片版本
-TOOL_VERSION = 2  # 0-XJ3, 1-J5, 2-J6
+TOOL_VERSION = 2  # 0-XJ3, 1-J5, 2-J6(B)
+
+# 芯片版本号 → 显示名称
+CHIP_NAMES = {0: "XJ3", 1: "J5", 2: "J6B"}
 
 # 默认端口
 DEFAULT_PORT = 10086
@@ -340,4 +343,5 @@ def parse_frame_info(header_fields: list) -> dict:
         'frame_id':   header_fields[IDX_FRAME_ID],
         'data_len':   header_fields[IDX_LEN],
         'chip_ver':   header_fields[IDX_CHIP_VERSION],
+        'code_type':  header_fields[IDX_CODE_TYPE],  # 编码类型 (H264=0, H265=1)
     }

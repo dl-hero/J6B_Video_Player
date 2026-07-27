@@ -1,10 +1,10 @@
 # J6B Video Player — 架构设计文档与使用说明
 
-> **版本**: 1.3.0  
-> **日期**: 2025-06-29  
+> **版本**: 1.5.0  
+> **日期**: 2026-07-25  
 > **适用平台**: Windows 10+ / Ubuntu 22.04+  
 > **目标设备**: J6B (Horizon Robotics J6 芯片平台)  
-> **已验证设备**: J6B_GAC_AY5-TM (IP: 172.16.0.14, 5 路摄像头)  
+> **已验证设备**: J6B_GAC_AY5-TM (IP: 192.168.0.140, 4 路 SC361AT 摄像头)  
 > **协议参考**: `hb_tool_server.h` / `hb_tool_server.c` / `camera_sample.c` / `socket_manager.c` / `server_cmd.h`
 
 ---
@@ -28,6 +28,17 @@
 | | | `hb_video_client.py` | 无变更 |
 | | | `hb_protocol.py` | 无变更 |
 | | | `DESIGN_DOC.md` | 更新 GUI 架构设计、组件树、渲染管线、数据流以反映田字格多路同时显示 |
+| **1.4.0** | **2026-07-11** | **`hb_video_client.py`** | **重大更新**: 新增 H.264 解码支持。`_recv_loop` 自动识别 `VIDEO_DATA` (type=3) 帧, 调用 `_decode_h264()` 通过 PyAV 解码为 BGR。新增 `_get_h264_decoder()` 按 pipe_id 独立管理解码器实例。NV12/YUV 原有路径不改动。 |
+| | | **`hb_protocol.py`** | `parse_frame_info` 返回值新增 `code_type` 字段 (H264=0, H265=1), 从帧头偏移 48 读取。 |
+| | | **`requirements.txt`** | 新增 `av>=10.0.0` (PyAV) — H.264 解码可选依赖。连接 NV12 流时无需此依赖。 |
+| | | **`tools/viotool/venc_stream/`** | **新增 J6B 设备端工具**: `venc_stream.c` (约 320 行) 实现 CIM4 四路 DDR → VPU 硬件 H.264 编码 → `hb_tool_send_video_pic()` TCP 输出。复用 `camera_sample` 的 VIO JSON + libhbplayer 协议栈。附带 `Makefile` 和 `run.sh` 一键启动脚本。 |
+| | | **`CLAUDE.md`** | 更新项目概述、命令列表、架构图、设计要点、参考文档, 反映双解码模式和新工具链。 |
+| | | `DESIGN_DOC.md` | 新增第 12 节「H.264 编解码链路」、第 13 节「设备端 venc_stream 工具」、更新目录结构、协议类型表、FAQ。 |
+| **1.5.0** | **2026-07-25** | **`venc_stream.c / Makefile / run.sh`** | **4路SC361AT H.264编码全链路调通**: 修复 `bit_rate` 字段名(`h264_cbr_params`), `decoding_refresh_type` H264 兼容性, 码率控制参数补全(先 `hb_mm_mc_get_rate_control_config` 取FW默认值再覆盖17字段), 低延迟优化(`vbv_buffer_size` 3000→300ms, `frame_buf_count` 5→3)。新增 `CAM_PORTS` 与 `PIPE_IDS` 分离。`external_frame_buf=0` + NV12 逐行memcpy(处理stride对齐)。配置文件默认指向 `GAC_BYPASS_TEST_4V_SC361ATSTD_1696x1168_RSEMI_RX4`。编译工具链切换为 QNX `qcc`。 |
+| | | **`hb_video_gui.py`** | 芯片版本显示修复 (J2→J6B, `CHIP_NAMES`映射), 配置文件持久化 `.j6b_player_config.json`(IP/端口/截图目录), 新增实时带宽显示(Mbps, 1秒采样), 去掉 `_update_display` 冗余图像拷贝(零拷贝引用传递)。 |
+| | | **`hb_video_client.py`** | **低延迟解码修复**: `decoder.parse()` → `av.Packet(data)` 直送解码器, 消除 PyAV parse 内部缓冲累积(实验验证延迟从几秒降到~200ms)。`thread_count=1` 单线程解码。 |
+| | | **`hb_protocol.py`** | 新增 `CHIP_NAMES = {0:'XJ3',1:'J5',2:'J6B'}` 显示映射字典。 |
+| | | `DESIGN_DOC.md` | 新增第 14 节「问题排查实录」。更新 13.5-13.8 节编译部署参数。 |
 
 ---
 
@@ -44,6 +55,8 @@
 9. [使用说明](#9-使用说明)
 10. [错误处理与异常恢复](#10-错误处理与异常恢复)
 11. [附录](#11-附录)
+12. [H.264 编解码链路](#12-h264-编解码链路)
+13. [设备端 venc_stream 工具](#13-设备端-venc_stream-工具)
 
 ---
 
@@ -335,12 +348,12 @@ hb_video_cli.py ──────┘       │                      │
 | 枚举值 | 名称 | 方向 | 说明 |
 |--------|------|------|------|
 | 0 | `RAW_DATA` | 设备→PC | RAW Bayer 数据 |
-| 1 | `YUV_DATA` | 设备→PC | YUV 数据（**本工具主要处理**） |
+| 1 | `YUV_DATA` | 设备→PC | YUV 数据（NV12, 原始像素流） |
 | 2 | `JPEG_DATA` | 设备→PC | JPEG 压缩数据 |
-| 3 | `VIDEO_DATA` | 设备→PC | H.264/H.265 编码视频 |
+| 3 | `VIDEO_DATA` | 设备→PC | **H.264/H.265 编码码流 (v1.4.0 新增支持)** |
 | 13 | `NET_SEND_CFG` | PC→设备 | **传输配置握手命令** |
 
-其余类型（`STATS_AWB_DATA`、`STATS_AEfull_DATA`、`ISP_INFO_DATA`、`ACT_CTL_DATA` 等）用于 ISP 调试和寄存器控制，本工具在接收循环中自动跳过（`_recv_loop` 中 `if data_type not in (DataType.YUV_DATA, DataType.RAW_DATA):` 分支）。
+其余类型（`STATS_AWB_DATA`、`STATS_AEfull_DATA`、`ISP_INFO_DATA`、`ACT_CTL_DATA` 等）用于 ISP 调试和寄存器控制，本工具在接收循环中自动跳过（`_recv_loop` 中 `if data_type not in (DataType.YUV_DATA, DataType.RAW_DATA, DataType.VIDEO_DATA):` 分支）。`VIDEO_DATA` 时调用 `_decode_h264()` 通过 PyAV 解码为 BGR 图像, 对上层透明。
 
 ### 3.5 NV12 数据布局
 
@@ -434,9 +447,16 @@ hb_video_cli.py ──────┘       │                      │
 }
 ```
 
-### 4.2 `hb_video_client.py` — 网络通信与解码层（440 行）
+### 4.2 `hb_video_client.py` — 网络通信与解码层（v1.4.0 更新: H.264 解码支持）
 
-**职责**: TCP 连接管理、帧接收、NV12→BGR 转换、帧回调通知。这是整个项目的核心引擎。
+**职责**: TCP 连接管理、帧接收、**自动识别 NV12/H.264 双格式**、解码、帧回调通知。这是整个项目的核心引擎。
+
+**解码模式自动选择**:
+
+| 帧头 type | 设备端来源 | 解码器 | 依赖 |
+|-----------|-----------|--------|------|
+| 1 (YUV_DATA) | camera_sample (NV12 原始流) | `_nv12_to_bgr()` 纯 numpy BT.601 | numpy |
+| 3 (VIDEO_DATA) | venc_stream (H.264 压缩流) | `_decode_h264()` PyAV | `pip install av` |
 
 **核心类**: `HBVideoClient`
 
@@ -468,13 +488,15 @@ hb_video_cli.py ──────┘       │                      │
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `_recv_loop()` | `() → None` | 接收线程主循环: 读头(80B)→验证魔数→读体(len)→NV12→BGR→通知回调 |
+| `_recv_loop()` | `() → None` | 接收线程主循环: 读头(80B)→验证魔数→读体(len)→根据 type 选择解码器→通知回调 |
 | `_recv_exact(size)` | `(int) → bytes \| None` | 精确接收指定字节数，超时或断开返回 `None` |
 | `_sync_to_header(partial_data)` | `(bytes) → bool` | 魔数搜索帧同步，最多扫描 1MB |
-| `_nv12_to_bgr(data, w, h, stride)` | `(bytes, int, int, int) → np.ndarray` | **静态方法**: NV12→BGR 色彩转换 |
+| `_nv12_to_bgr(data, w, h, stride)` | `(bytes, int, int, int) → np.ndarray` | **静态方法**: NV12→BGR 色彩转换 (ITU-R BT.601) |
+| `_decode_h264(data, pipe_id, info)` | `(bytes, int, dict) → np.ndarray \| None` | **v1.4.0 新增**: H.264 AnnexB→PyAV 解码为 BGR, 返回 None 表示需要更多数据 |
+| `_get_h264_decoder(pipe_id)` | `(int) → av.CodecContext` | **v1.4.0 新增**: 获取/创建指定 pipe 的 H.264 解码器实例, 按 pipe_id 独立管理 |
 | `_notify_frame(info, img)` | `(dict, np.ndarray) → None` | 遍历回调列表，逐个调用，异常不中断 |
 
-**`_recv_loop` 接收循环详细流程**:
+**`_recv_loop` 接收循环详细流程 (v1.4.0 更新)**:
 
 ```
 while self._running:
@@ -485,20 +507,21 @@ while self._running:
     │     失败 → error_count++, continue
     │
     ├─ 3. verify_header(header_fields) → bool
-    │     失败 → _sync_to_header(header_data) → 成功则 continue, 失败则 error_count++
+    │     失败 → _sync_to_header(header_data)
     │
-    ├─ 4. 检查 data_type ∈ {YUV_DATA, RAW_DATA}
-    │     否 → _recv_exact(data_len) 丢弃, continue
+    ├─ 4. 检查 data_type ∈ {YUV_DATA, RAW_DATA, VIDEO_DATA}
+    │     否 → 丢弃, continue
     │
     ├─ 5. data_len == 0 → continue
     │
     ├─ 6. _recv_exact(data_len) → body_data
-    │     失败 → error_count++, continue
     │
     ├─ 7. parse_frame_info(header_fields) → frame_info
     │
-    ├─ 8. _nv12_to_bgr(body_data, width, height, stride) → bgr_image
-    │     失败 → error_count++, continue
+    ├─ 8. 根据 data_type 选择解码器:
+    │     YUV_DATA(1)  → _nv12_to_bgr()  numpy 转换
+    │     VIDEO_DATA(3) → _decode_h264()  PyAV 解码
+    │     RAW_DATA(0)  → _nv12_to_bgr()  (与 YUV 同路径)
     │
     ├─ 9. _lock: frame_count++
     │
@@ -1280,31 +1303,43 @@ logging.basicConfig(level=logging.WARNING)
 
 | 文件 | 行数 | 类型 | 说明 |
 |------|------|------|------|
-| `hb_protocol.py` | 342 | 纯协议层 | 常量、枚举 (5 个类)、结构体布局、打包/解包/验证函数 (6 个) |
-| `hb_video_client.py` | 440 | 核心引擎层 | `HBVideoClient` 类: TCP 连接、帧接收、NV12→BGR、回调管理 |
-| `hb_video_gui.py` | 474 | GUI 界面层 | `HBVideoGUI` 类: tkinter 窗口、田字格多路同时渲染、PIL 缩放、截图、信息面板 |
-| `hb_video_cli.py` | 179 | CLI 界面层 | `CLIVideoClient` 类: argparse 参数、OpenCV 显示、帧保存 |
-| `requirements.txt` | 2 | 依赖声明 | `numpy>=1.21.0`, `opencv-python>=4.5.0`, `Pillow>=9.0.0` |
+| `hb_protocol.py` | 343 | 纯协议层 | 常量、枚举 (5 个类)、结构体布局、打包/解包/验证函数 (6 个), `parse_frame_info` 含 `code_type` 字段 |
+| `hb_video_client.py` | ~490 | 核心引擎层 | `HBVideoClient` 类: TCP 连接、自动识别 NV12/H.264、双解码器 (`_nv12_to_bgr` + `_decode_h264`)、回调管理 |
+| `hb_video_gui.py` | ~570 | GUI 界面层 | `HBVideoGUI` 类: tkinter 窗口、田字格多路同时渲染、PIL 缩放、截图、信息面板 |
+| `hb_video_cli.py` | ~265 | CLI 界面层 | `CLIVideoClient` 类: argparse 参数、多路网格显示、OpenCV 显示、帧保存 |
+| `requirements.txt` | 4 | 依赖声明 | `numpy`, `opencv-python`, `Pillow`, `av` (PyAV, H.264 解码可选) |
+| `tools/viotool/venc_stream/src/venc_stream.c` | ~320 | J6B 设备端 C | CIM4 四路 DDR→VPU H.264→TCP (MediaCodec + libhbplayer) |
+| `CLAUDE.md` | — | AI 辅助 | 项目规范、命令、架构速查 |
 | `README.md` | — | 简要说明 | 项目简介、快速开始、协议概述 |
-| `DESIGN_DOC.md` | — | 架构文档 | 本文档 |
+| `DESIGN_DOC.md` | — | 架构文档 | 本文档 (v1.4.0) |
 
 ### 11.2 项目目录建议
 
 ```
 J6B_Video_Player/
-├── hb_protocol.py          # 协议定义
-├── hb_video_client.py      # 核心通信引擎
-├── hb_video_gui.py         # GUI 界面入口
-├── hb_video_cli.py         # 命令行入口
-├── requirements.txt        # Python 依赖
-├── README.md               # 简要说明
-├── DESIGN_DOC.md           # 架构设计文档
-├── snapshots/              # 截图保存目录 (自动创建)
-├── frames/                 # 帧保存目录 (CLI --save 自动创建)
-└── .gitignore              # 建议添加 (见 11.3)
+├── hb_protocol.py              # 协议定义
+├── hb_video_client.py          # 核心通信引擎 (支持 NV12 + H.264)
+├── hb_video_gui.py             # GUI 界面入口
+├── hb_video_cli.py             # 命令行入口
+├── requirements.txt            # Python 依赖 (含 PyAV)
+├── CLAUDE.md                   # AI 辅助规范
+├── README.md                   # 简要说明
+├── DESIGN_DOC.md               # 架构设计文档 (本文档)
+├── tools/viotool/
+│   ├── libhbplayer/            # J6B TCP Server 库 (hb_tool_server 源码)
+│   └── venc_stream/            # [新增] J6B H.264 编码+流式输出工具
+│       ├── src/venc_stream.c   #   主程序
+│       ├── src/Makefile        #   交叉编译
+│       ├── bin/run.sh          #   一键启动脚本
+│       └── README.md           #   编译部署说明
+├── ref_docs/
+│   ├── document/               # J6B SDK 手册 (HTML)
+│   ├── S83E04_Module/          # J6B Sample 源码 (camera/ codec/ vio)
+│   └── tools/                  # J6B 工具参考 (libhbplayer, tuning_tool)
+├── snapshots/                  # 截图保存目录 (自动创建)
+├── frames/                     # 帧保存目录 (CLI --save 自动创建)
+└── .gitignore                  # 建议添加
 ```
-
-### 11.3 建议的 `.gitignore`
 
 ```gitignore
 # Python 字节码缓存
@@ -1380,10 +1415,257 @@ Camera_player/
 
 ### 11.6 扩展开发建议
 
-1. **支持 H.264/H.265 解码**: 在 `_recv_loop` 中识别 `VIDEO_DATA` (3) 类型，使用 PyAV/FFmpeg 进行硬件解码
+1. **支持 H.264/H.265 解码**: ✅ **已实现 (v1.4.0)**。`_recv_loop` 中自动识别 `VIDEO_DATA` (3) 帧, 调用 `_decode_h264()` 通过 PyAV 软解码为 BGR。详见 [第 12 节](#12-h264-编解码链路)。
 2. **多路视频同时显示**: ✅ 已实现。田字格自动布局，所有活跃通道通过同一 TCP 连接交错接收后同时渲染，每路视频顶部叠加信息条。
 3. **录制功能**: 在帧回调中使用 `cv2.VideoWriter` 保存为 MP4 文件
 4. **AI 推理集成**: 在帧回调中将帧放入队列，由独立工作线程调用 ONNX Runtime / OpenCV DNN 进行目标检测
 5. **Web 远程监控**: 将 `HBVideoClient` 封装为 FastAPI 服务，通过 WebSocket 或 MJPEG 流推送到浏览器
 6. **RAW 数据支持**: 实现 Bayer→RGB 去马赛克算法，支持 `RAW_DATA` 类型的可视化
 7. **ISP 调试面板**: 解析 `STATS_AWB_DATA`、`STATS_AEfull_DATA` 等 ISP 统计数据类型，在 GUI 中展示调试信息
+8. **J6B 设备端 H.264 压缩**: ✅ **已实现 (v1.4.0)**。`tools/viotool/venc_stream/` 实现 CIM4 四路 VPU 硬件编码 + TCP 输出, 带宽降低 95%+。详见 [第 13 节](#13-设备端-venc_stream-工具)。
+---
+
+## 12. H.264 编解码链路 (v1.4.0 新增)
+
+### 12.1 概览
+
+v1.4.0 在 PC 端 `hb_video_client.py` 新增 H.264 解码能力，与 J6B 设备端 `venc_stream` 工具（见第 13 节）配合使用，形成完整的 H.264 编解码链路。
+
+### 12.2 数据流对比
+
+```
+【NV12 路径 (camera_sample)】
+J6B: CIM → DDR → hb_tool_send_yuv_pic → TCP (NV12 原始像素)
+PC:  _recv_loop → YUV_DATA(1) → _nv12_to_bgr() numpy → BGR
+带宽: 1696×1168×1.5×30fps×4路 ≈ 356 MB/s (远超千兆网)
+
+【H.264 路径 (venc_stream)】
+J6B: CIM → DDR → VPU Encoder → hb_tool_send_video_pic → TCP (H.264 码流)
+PC:  _recv_loop → VIDEO_DATA(3) → _decode_h264() PyAV → BGR
+带宽: 4 Mbps × 4 路 = 16 Mbps (千兆网充裕)
+```
+
+### 12.3 PC 端解码实现
+
+**自动类型识别** (`_recv_loop` 第 267-285 行):
+
+```python
+if data_type == DataType.VIDEO_DATA:
+    bgr_image = self._decode_h264(body_data, pipe_id, frame_info)
+    if bgr_image is None:
+        continue  # 解码器缓冲中, 等待更多数据
+else:
+    bgr_image = self._nv12_to_bgr(body_data,
+        frame_info['width'], frame_info['height'], frame_info['stride'])
+```
+
+**PyAV 解码器管理** (`_get_h264_decocer` / `_decode_h264`):
+
+- 每个 `pipe_id` 维护独立的 `av.CodecContext` 实例
+- `decoder.parse(data)` 将 AnnexB NAL 单元解析为 packet
+- `decoder.decode(packet)` 输出 VideoFrame → `to_ndarray(format='bgr24')`
+- 返回 `None` 表示当前数据不足以产出一帧 (解码器自动缓冲)
+
+**依赖**:
+
+```bash
+pip install av  # PyAV, 仅连接 venc_stream 时需要
+```
+
+NV12 流 (camera_sample) 不需要 PyAV，纯 numpy 即可工作。
+
+### 12.4 带宽对比
+
+| 场景 | 分辨率 | 格式 | 带宽 (4路 @30fps) | 千兆网可行性 |
+|------|--------|------|-------------------|-------------|
+| camera_sample | 1696×1168 | NV12 原始 | ~356 MB/s | ❌ 超带宽 |
+| venc_stream | 1696×1168 | H.264 4Mbps | ~16 Mbps | ✅ 仅占 1.6% |
+| venc_stream | 1920×1080 | H.264 4Mbps | ~16 Mbps | ✅ |
+
+### 12.5 帧头新增字段
+
+`parse_frame_info` 返回值新增 `code_type` 字段:
+
+| 字段 | 帧头偏移 | 说明 |
+|------|---------|------|
+| `code_type` | 48 (IDX_CODE_TYPE) | 编码类型: 0=H264, 1=H265, 2=PPS |
+
+---
+
+## 13. 设备端 venc_stream 工具 (v1.4.0 新增)
+
+### 13.1 功能概述
+
+`tools/viotool/venc_stream/` 是 J6B 设备端新增的 C 程序，实现以下功能:
+
+1. **CIM4 四路 DDR 视频采集** — 复用 camera_sample 的 VIO JSON 配置
+2. **VPU 硬件 H.264 编码** — 4 个 MediaCodec encoder 实例并发
+3. **TCP 码流输出** — 通过 `hb_tool_send_video_pic()` 发送到 PC 端
+
+### 13.2 文件结构
+
+```
+tools/viotool/venc_stream/
+├── README.md              # 编译、部署、运行说明
+├── bin/
+│   └── run.sh             # J6B 设备端一键启动脚本 (3 行)
+└── src/
+    ├── venc_stream.c      # 主程序 (~320 行)
+    └── Makefile           # SDK 交叉编译配置
+```
+
+### 13.3 数据流
+
+```
+Camera ×4 (MIPI RX4)
+    │
+    ▼
+CIM4 (4×IPI, ddr_enable=1, cim_isp_flyby=0)   ← 不经过 ISP/PYM
+    │  hb_cam_get_data(pipe_id, HB_CAM_YUV_DATA)
+    ▼
+DDR ion buffer (零拷贝)
+    │  hb_mm_mc_dequeue_input_buffer + phys_addr 填入
+    ▼
+VPU Encoder ×4 (MediaCodec, poll 模式)
+    │  hb_mm_mc_dequeue_output_buffer
+    ▼
+H.264 AnnexB 码流
+    │  hb_tool_send_video_pic(g_ev, &pic_info, ptr, size)
+    ▼
+TCP port 10086 → PC 端 hb_video_client
+```
+
+### 13.4 核心代码结构
+
+```c
+main():
+  ├── hb_vio_init(vpm_cfg)            // 复用 camera_sample 的 VIO JSON
+  ├── hb_cam_init(cam_cfg)            // 复用 camera_sample 的 Camera JSON
+  ├── for i=0..3: hb_vio_start_pipeline(i)
+  ├── g_tool_ev = hb_tool_start_transfer(10086)  // TCP Server
+  │
+  ├── for i=0..3:
+  │     init_encoder(&g_ch[i])         // H.264 CBR 4Mbps, GOP I-P-P-P…
+  │     pthread_create → feed_thread   // hb_cam_get_data → queue input
+  │     pthread_create → output_thread // select poll_fd → send TCP
+  │
+  └── while(!quit): sleep(5); print_stats()
+```
+
+### 13.5 编码参数（实测生效）
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 传感器 | SC361AT ×4 | GAC_BYPASS bypass 模式 |
+| Pipeline ID | 7, 8, 9, 10 | vpm_config.json pipeline7-10 |
+| CAM Port | 7, 8, 9, 10 | hb_j6dev.json port_7-10 |
+| 分辨率 | 1696×1168 | extra_mode=10 有效像素 |
+| 帧率 | 30fps | 4 路合计 ~120fps |
+| 编码格式 | H.264 CBR | `MC_AV_RC_MODE_H264CBR` |
+| 码率 | 4000 kbps/路 | 总带宽 ~16 Mbps (100M 占 ~20%) |
+| GOP | I-P-P-P… | `gop_preset_idx = 9`, `decoding_refresh_type = 2` |
+| 输入格式 | NV12 | CIM DDR 输出已为 NV12 (hb_mipi sc361at_nv12) |
+| Buffer 模式 | internal | `external_frame_buf = 0`, memcpy 逐行拷贝 (处理 stride 对齐) |
+| VBV 缓冲 | 300ms | 低延迟配置 (I帧~120KB, VBV~150KB 安全) |
+| 帧缓冲数 | 3 | `frame_buf_count = bitstream_buf_count = 3` |
+| TCP 端口 | 10086 | `hb_tool_start_transfer(DEFAULT_PORT)` |
+| 配置文件 | `case_matrix/GAC_BYPASS_TEST_4V_SC361ATSTD_1696x1168_RSEMI_RX4` | |
+| 编译器 | QNX `qcc -Vgcc_ntoaarch64le` | aarch64-unknown-nto-qnx8.0.0-gcc |
+
+### 13.6 编译与部署
+
+```bash
+# 1. 在 SDK 开发机上，先执行完整构建 (产生所需 .so)
+cd /media/jinnuo/work/SourceCode/HR-J6B/BaseSW_J6B_BS
+docker run -it --rm -v $(pwd):$(pwd) -w $(pwd) \
+    docker.hobot.cc/systemsoft/devenv/debian-12:latest /bin/bash
+# 容器内:
+source build_tools/Compiler/qnx800/qnxsdp-env.sh
+source envsetup.sh
+bdall BAIC
+
+# 2. bdall 完成后，在 host 环境编译 venc_stream (需先 source qnxsdp-env.sh + envsetup.sh)
+cd tools/viotool/venc_stream/src
+make clean && make && cp venc_stream ../bin/
+
+# 3. 部署到 J6B
+scp bin/venc_stream bin/run.sh root@192.168.0.140:/app/sample/S83_Sample/S83E04_Module/venc_stream/bin/
+```
+
+### 13.7 运行
+
+```bash
+# J6B 设备端（需先 kill camera_sample 释放 VIO 资源）
+killall camera_sample
+cd /app/sample/S83_Sample/S83E04_Module/venc_stream/bin
+./run.sh
+
+# PC 端（等 J6B TCP server ready 后再连接）
+python3 hb_video_gui.py
+```
+
+### 13.8 注意事项
+
+1. **与 camera_sample 互斥**: venc_stream 独立初始化 VIO/Cam, 不能与 camera_sample 同时运行。
+2. **先 PC 连接再启动编码器**: 编码器产帧后立即 TCP 发送, PC 未连时可能丢帧(不影响后续)。
+3. **debug 开关**: `VENC_DEBUG 0/1` 宏控制 stderr 调试日志(首帧 stride 对比, 每 100 帧计数, STAT 各路详情)。
+4. **切换传感器配置**: 修改 `PIPE_IDS[]` / `CAM_PORTS[]` / `run.sh` 的 `CFG_BASE` 路径即可适配不同配置。
+5. **低延迟参数**: `vbv_buffer_size=300ms` + `frame_buf_count=3` 为核心低延迟配置; 若画面花屏, 改回 500/5。
+6. **PC 低延迟解码**: `av.Packet(data)` 直送(非 `decoder.parse`), 消除 PyAV 缓冲累积; `thread_count=1` 单线程。
+
+---
+
+## 14. 问题排查实录 (v1.5.0 调试过程)
+
+> **参考对话**: "J6B H.264 视频流输出" (2026-07-25), 约 120 轮交互。
+> **涉及的库/头文件**: `hb_media_codec.h`, `hb_vpm_data_info.h`, `hb_tool_server.h`, `hb_vio_interface.h`, `hb_media_error.h`
+> **参考代码**: `camera_sample.c`, `codec_sample/sample.c`, `codec_sample/sample_venc.c`, `codec_sample/sample_common.c`
+
+### 14.1 问题总览
+
+| # | 阶段 | 错误现象 | 根因 | 修复 |
+|---|------|---------|------|------|
+| 1 | 编译 | `has no member named 'h264_cbr'` | 字段名错误: SDK头文件中联合体成员为 `h264_cbr_params` (完整后缀) | `h264_cbr` → `h264_cbr_params` |
+| 2 | 编译 | 链接时 `libepoll.so.1 not found` 等 QNX 系统库缺失 | 使用了 Linux `aarch64-none-linux-gnu-gcc` 而非 QNX 编译器 | 切换为 QNX `qcc -Vgcc_ntoaarch64le` |
+| 3 | 编译 | `cannot find -lpthread, -ldl` | QNX 的 pthread/dl 功能已合并进 libc, 无需独立链接 | 删除 `-lpthread -ldl` |
+| 4 | 编译 | `cc: unknown option: '-w1'` | QNX qcc 底层 gcc 不认识该选项 | `-w1` → `-Wall` |
+| 5 | 运行 | `hb_mm_mc_configure fail(0xF0000009)` INVALID_PARAMS | 码率值 `4*1024*1024` 被注入 `bit_rate` 字段(单位 kbps), 实际值 4G kbps 超限 | `ENC_BITRATE` → `4000` (kbps) |
+| 6 | 运行 | 同上 INVALID_PARAMS | `decoding_refresh_type=2` 仅 H265 有效, H264 需清零 | 删除该字段(H264 使用默认值) |
+| 7 | 运行 | 同上 INVALID_PARAMS | `vbv_buffer_size=0` (memset后未赋值), 不在有效范围 [10,3000] | 先 `hb_mm_mc_get_rate_control_config` 取FW默认值, 再覆盖全部 17 个码率控制字段 |
+| 8 | 运行 | 编码器初始化OK, 输出 1-2 帧后 `HB_MEDIA_ERR_UNKNOWN` | `external_frame_buf=1` 零拷贝模式给编码器填了 NV12 buffer, 但 CIM DDR 实际输出 YUV422→编码器按 NV12 读导致数据错位 | 改为 `external_frame_buf=0` + memcpy NV12 数据到编码器内部 buffer |
+| 9 | 运行 | 同上 UNKNOWN | 连续 memcpy 未处理 stride 对齐差异 (CIM stride=1696 vs Encoder stride 可能对齐到 32/64) | 逐行 memcpy, 每行只拷贝 `width` 字节, 跳过 padding |
+| 10 | 延迟 | PC 端播放有数秒延迟 | PyAV `decoder.parse()` 内部流式缓冲, 碎片 NAL 单元被缓冲等待拼帧 | `decoder.parse()` → `av.Packet(data)` 直送解码器 |
+| 11 | 延迟 | 编码器端 ~3 秒缓冲 | `vbv_buffer_size=3000ms` 预留大缓冲平滑码率 | 逐步压缩至 300ms (`vfv=300ms, I帧 120KB 安全`) |
+| 12 | PC | GUI 显示「芯片版本: J2」(应为 J6B) | `TOOL_VERSION=2` 直接拼接到 `J{chip_ver}` | 新增 `CHIP_NAMES` 映射字典 |
+| 13 | PC | `SyntaxError: f-string expr不能包含反斜杠` | Python 3.11-: f-string 内不能有 `\"` | 提取 chip_name 为独立变量 |
+
+### 14.2 关键发现: 延迟瓶颈在 PC 端而非 J6B 编码器
+
+**实验证据**:
+- **实验 A**: J6B 启动流后, 移动摄像头→立即连 PC GUI → 显示移动后的画面。**结论: J6B 输出实时**。
+- **实验 B**: PC 已连接播放一段时间后, 移动摄像头→需等数秒才在 PC 端看到变化。**结论: PC 端缓冲累积**。
+
+**根因**: PyAV 的 `CodecContext.parse()` 是流式解析器, 把零碎的 H.264 AnnexB 数据缓存并等待完整 NAL 单元才输出。长时间运行后, parse 内部缓冲持续保持 N 帧的 feed-decode 偏移, 导致「看到的是 N 帧前的画面」。
+
+**最终方案**: `av.Packet(data)` 直接把完整帧(接收线程已按 80B 帧头 + data_len 拼好一整帧)喂给解码器, **零缓冲**。配合 `thread_count=1` 单线程解码, 总延迟从数秒降到 ~200ms 级别。
+
+### 14.3 PC 端数据流 (无冗余拷贝版)
+
+```
+TCP recv(80B 帧头 + H.264 码流)
+  → av.Packet(data)                    // 无需 parse, 直送
+  → decoder.decode(packet)             // FFmpeg VPU 软件解码
+  → frame.to_ndarray(bgr24)            // ①唯一的图像拷贝 (PyAV 内部 buffer 复用)
+  → self._pipe_frames[pipe_id] = (...)  // 引用传递, 覆盖旧帧
+  → _update_display()                  // 取引用 (不加锁拷贝)
+  → BGR[::-1] view → PIL → ImageTk     // ②渲染拷贝
+```
+
+### 14.4 长时稳定性保障
+
+| 层面 | 措施 |
+|------|------|
+| 内存 | `_on_frame_received` 只保留最新帧(覆盖旧帧, GC自动回收), `_update_display` 零拷贝引用传递 |
+| 解码 | 每路独立 `av.CodecContext`, 单路异常不影响其他; `except→return None`, 下帧自动恢复 |
+| TCP | `_sync_to_header` 魔数扫描+滑动窗口, 断流自动重同步; `select` + timeout 防止阻塞 |
+| 编码器 | `VENC_DEBUG` 宏开关, 各路 feed/output/error 独立计数, STAT 每 5 秒汇报

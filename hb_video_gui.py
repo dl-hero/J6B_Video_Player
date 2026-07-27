@@ -17,6 +17,7 @@ hb_video_gui.py - J6B 视频流 GUI 显示 (多路视频田字格同时显示)
 """
 
 import os
+import json
 import time
 import threading
 import tkinter as tk
@@ -28,7 +29,10 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from hb_video_client import HBVideoClient
-from hb_protocol import DEFAULT_PORT
+from hb_protocol import DEFAULT_PORT, CHIP_NAMES
+
+# 配置文件路径
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".j6b_player_config.json")
 
 
 class HBVideoGUI:
@@ -53,6 +57,11 @@ class HBVideoGUI:
         self._pipe_fps_count: dict[int, int] = defaultdict(int)
         self._fps_start_time = time.time()
 
+        # 带宽统计 (帧接收线程累加, 主线程每秒读取清零)
+        self._bytes_received = 0
+        self._bandwidth_bytes = 0
+        self._bw_lock = threading.Lock()
+
         # 当前选中的 pipe (用于截图 + 右侧详情面板)
         self._selected_pipe: int | None = None
         self._available_pipes: list[int] = []
@@ -61,8 +70,14 @@ class HBVideoGUI:
         self._snapshot_count = 0
         self._snapshot_dir = "./snapshots"
 
+        # 加载配置
+        self._config = self._load_config()
+
         # 构建 UI
         self._build_ui()
+
+        # 恢复上次配置到输入框
+        self._restore_config()
 
         # 定时刷新画面 (30ms ≈ 33fps)
         self._update_display()
@@ -100,12 +115,10 @@ class HBVideoGUI:
         ttk.Label(row1, text="设备 IP:").pack(side=tk.LEFT, padx=2)
         self.ip_entry = ttk.Entry(row1, width=16)
         self.ip_entry.pack(side=tk.LEFT, padx=2)
-        self.ip_entry.insert(0, "172.16.0.14")
 
         ttk.Label(row1, text="端口:").pack(side=tk.LEFT, padx=(10, 2))
         self.port_entry = ttk.Entry(row1, width=8)
         self.port_entry.pack(side=tk.LEFT, padx=2)
-        self.port_entry.insert(0, str(DEFAULT_PORT))
 
         self.connect_btn = ttk.Button(row1, text="连接", command=self._toggle_connection)
         self.connect_btn.pack(side=tk.LEFT, padx=(10, 2))
@@ -130,8 +143,10 @@ class HBVideoGUI:
             side=tk.LEFT, padx=2
         )
 
+        self.bw_label = ttk.Label(row1, text="带宽: --")
+        self.bw_label.pack(side=tk.RIGHT, padx=5)
         self.fps_label = ttk.Label(row1, text="FPS: --")
-        self.fps_label.pack(side=tk.RIGHT, padx=10)
+        self.fps_label.pack(side=tk.RIGHT, padx=5)
 
     def _build_video_panel(self, parent):
         """构建视频显示面板 (多路田字格)."""
@@ -328,6 +343,7 @@ class HBVideoGUI:
         self.status_var.set(f"已连接 {host}:{port} | 等待视频流...")
         self._log(f"✓ 已连接到 {host}:{port}")
         self._log("等待视频流数据...")
+        self._save_config()  # 连接成功后保存配置
 
     def _on_connect_failed(self):
         """连接失败回调 (主线程)."""
@@ -336,7 +352,7 @@ class HBVideoGUI:
         self._log("✗ 连接失败，请检查设备 IP 和端口")
         messagebox.showerror("连接失败", "无法连接到设备，请检查:\n"
                              "1. 设备 IP 地址是否正确\n"
-                             "2. 设备端 camera_sample 是否运行\n"
+                             "2. 设备端 venc_stream 是否已启动 (TCP server ready)\n"
                              "3. 网络是否通畅")
 
     def _disconnect(self):
@@ -349,6 +365,7 @@ class HBVideoGUI:
         self.status_var.set("已断开")
         self._log("已断开连接")
         self.fps_label.config(text="FPS: --")
+        self.bw_label.config(text="带宽: --")
 
         with self._frame_lock:
             self._pipe_frames.clear()
@@ -400,17 +417,15 @@ class HBVideoGUI:
 
     def _on_frame_received(self, frame_info: dict, bgr_image: np.ndarray):
         """
-        接收到新帧. 按 pipe_id 分路存储.
+        接收到新帧, 按 pipe_id 分路存储 (仅保留最新帧, 覆盖旧帧).
 
-        Args:
-            frame_info: 帧信息字典
-            bgr_image:  BGR 格式图像
+        在接收线程中同步调用, 需尽快返回。只做深拷贝 + 引用交换。
         """
         pipe_id = frame_info['pipe_id']
 
         with self._frame_lock:
-            # 深拷贝存储
-            self._pipe_frames[pipe_id] = (bgr_image.copy(), dict(frame_info))
+            # 深拷贝 (PyAV 解码器会复用 buffer), 覆盖旧帧即可
+            self._pipe_frames[pipe_id] = (bgr_image.copy(), frame_info)
 
             # 跟踪可用 pipe
             if pipe_id not in self._available_pipes:
@@ -418,6 +433,10 @@ class HBVideoGUI:
 
         # 各路 FPS 统计
         self._pipe_fps_count[pipe_id] = self._pipe_fps_count.get(pipe_id, 0) + 1
+
+        # 带宽统计 (帧数据量 + 80B 协议帧头)
+        with self._bw_lock:
+            self._bytes_received += frame_info['data_len'] + 80
 
         # 全局 FPS 统计
         now = time.time()
@@ -427,6 +446,10 @@ class HBVideoGUI:
             for pid, count in self._pipe_fps_count.items():
                 self._pipe_fps[pid] = count / elapsed
             self._pipe_fps_count.clear()
+            # 更新带宽
+            with self._bw_lock:
+                self._bandwidth_bytes = self._bytes_received
+                self._bytes_received = 0
             self._fps_start_time = now
 
     # ------------------------------------------------------------------
@@ -437,12 +460,13 @@ class HBVideoGUI:
         """定时刷新所有通道画面 (30ms)."""
         self._update_pipe_combo()
 
-        # 获取所有通道的最新帧快照 (在锁内批量拷贝)
+        # 一次性取出所有通道的最新帧引用 (swap, 不加拷贝)
         frames_snapshot: dict[int, tuple[np.ndarray, dict]] = {}
         with self._frame_lock:
             for pid in list(self._pipe_frames.keys()):
-                frame, info = self._pipe_frames[pid]
-                frames_snapshot[pid] = (frame.copy(), dict(info))
+                frames_snapshot[pid] = self._pipe_frames[pid]
+
+        # 确保所有活跃通道有对应显示单元
 
         # 确保所有活跃通道有对应显示单元
         for pid in frames_snapshot:
@@ -462,6 +486,14 @@ class HBVideoGUI:
         self.fps_label.config(
             text=f"总FPS: {total_fps:.1f}" if total_fps > 0 else "FPS: --"
         )
+
+        # 更新带宽标签 (Mbps)
+        with self._bw_lock:
+            bw_mbps = self._bandwidth_bytes * 8 / 1_000_000
+        if bw_mbps > 0:
+            self.bw_label.config(text=f"带宽: {bw_mbps:.1f} Mbps")
+        else:
+            self.bw_label.config(text="带宽: --")
 
         self.root.after(30, self._update_display)
 
@@ -532,6 +564,7 @@ class HBVideoGUI:
     def _update_info_panel(self, frame_info: dict, pipe_id: int):
         """更新当前帧详情面板."""
         fps = self._pipe_fps.get(pipe_id, 0)
+        chip_name = CHIP_NAMES.get(frame_info['chip_ver'], f"J{frame_info['chip_ver']}")
         info_lines = [
             f"通道:     Pipe {pipe_id}",
             f"FPS:      {fps:.1f}",
@@ -542,7 +575,7 @@ class HBVideoGUI:
             f"帧序号:   #{frame_info['frame_id']}",
             f"CHN ID:   {frame_info['chn_id']}",
             f"数据长度: {frame_info['data_len']:,} bytes",
-            f"芯片版本: J{frame_info['chip_ver']}",
+            f"芯片版本: {chip_name}",
         ]
         text = "\n".join(info_lines)
 
@@ -634,6 +667,7 @@ class HBVideoGUI:
         if directory:
             self._snapshot_dir = directory
             self._log(f"截图目录: {directory}")
+            self._save_config()  # 保存配置
 
     # ------------------------------------------------------------------
     # 日志
@@ -648,6 +682,45 @@ class HBVideoGUI:
         self.log_text.insert(tk.END, line)
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
+
+    # ------------------------------------------------------------------
+    # 配置文件持久化
+    # ------------------------------------------------------------------
+
+    def _load_config(self) -> dict:
+        """从 JSON 文件加载配置."""
+        defaults = {
+            "host": "172.16.0.14",
+            "port": DEFAULT_PORT,
+            "snapshot_dir": "./snapshots",
+        }
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                defaults.update(saved)
+        except Exception:
+            pass  # UI 尚未构建，静默使用默认值
+        return defaults
+
+    def _save_config(self):
+        """保存当前配置到 JSON 文件."""
+        config = {
+            "host": self.ip_entry.get().strip(),
+            "port": self.port_entry.get().strip(),
+            "snapshot_dir": self._snapshot_dir,
+        }
+        try:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self._log(f"保存配置文件失败: {e}")
+
+    def _restore_config(self):
+        """恢复配置到 UI 输入框."""
+        self.ip_entry.insert(0, self._config.get("host", "172.16.0.14"))
+        self.port_entry.insert(0, str(self._config.get("port", DEFAULT_PORT)))
+        self._snapshot_dir = self._config.get("snapshot_dir", "./snapshots")
 
     # ------------------------------------------------------------------
     # 关闭
