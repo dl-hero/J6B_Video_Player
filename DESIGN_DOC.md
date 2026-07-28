@@ -1,7 +1,7 @@
 # J6B Video Player — 架构设计文档与使用说明
 
-> **版本**: 1.5.0  
-> **日期**: 2026-07-25  
+> **版本**: 1.6.0  
+> **日期**: 2026-07-28  
 > **适用平台**: Windows 10+ / Ubuntu 22.04+  
 > **目标设备**: J6B (Horizon Robotics J6 芯片平台)  
 > **已验证设备**: J6B_GAC_AY5-TM (IP: 192.168.0.140, 4 路 SC361AT 摄像头)  
@@ -39,6 +39,10 @@
 | | | **`hb_video_client.py`** | **低延迟解码修复**: `decoder.parse()` → `av.Packet(data)` 直送解码器, 消除 PyAV parse 内部缓冲累积(实验验证延迟从几秒降到~200ms)。`thread_count=1` 单线程解码。 |
 | | | **`hb_protocol.py`** | 新增 `CHIP_NAMES = {0:'XJ3',1:'J5',2:'J6B'}` 显示映射字典。 |
 | | | `DESIGN_DOC.md` | 新增第 14 节「问题排查实录」。更新 13.5-13.8 节编译部署参数。 |
+| **1.6.0** | **2026-07-28** | **`hb_video_client.py`** | **重大重构**: 并行解码架构 + H.264 解码路径修复 + 带宽统计修正。**解码路径**: `av.Packet(data)` 直送 → `decoder.parse(data)` 逐个 NAL 单元解码 (修复 AVERROR_INVALIDDATA)。**线程模型**: 接收线程仅负责 socket read→分发, 每路独立解码线程 (`_pipe_decode_loop`) 通过 `queue.Queue(maxsize=2)` 并行处理。**解码器**: `thread_count` 1→0 (FFmpeg auto 多线程), `flags|=4` (OUTPUT_CORRUPT)。**带宽统计**: 从回调点移至 `_read_one_frame()` 数据读取点, 统计所有帧的实际接收字节。**移除**: 排空机制 (导致显示帧率从 25fps 降至 2fps)。**线程安全**: 回调列表加 `_callbacks_lock`。**稳定性验证**: 5 分钟/10 小时压力测试, 解码速率恒定 100fps, 零错误, 无延迟累积。 |
+| | | **`hb_video_gui.py`** | 带宽统计改用 `client.get_stats()['total_bytes']` (实际接收字节数)。 |
+| | | **`CLAUDE.md`** | 更新延迟优化说明、架构描述、H.264 解码路径、线程安全说明。 |
+| | | **`DESIGN_DOC.md`** | 新增第 14.5 节「v1.6.0 调试实录」。更新第 5 节线程模型、第 12 节 H.264 编解码链路、第 14 节问题排查。新增第 9.6 节「生成 Windows 可执行文件 (exe)」— PyInstaller 打包命令与参数说明。 |
 
 ---
 
@@ -637,11 +641,11 @@ while self._running:
 
 ## 5. 数据流与线程模型
 
-### 5.1 线程架构 (GUI 模式)
+### 5.1 线程架构 (GUI 模式, v1.6.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                           线程模型 (GUI 模式)                        │
+│                      线程模型 (GUI 模式, v1.6.0)                     │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │  Main Thread (主线程 / GUI 线程)                               │   │
@@ -652,20 +656,32 @@ while self._running:
 │  │  - 遍历 _pipe_cells 逐个渲染 (_render_cell)                      │   │
 │  │  - BGR→RGB→PIL.Image→ImageTk.PhotoImage→Canvas 渲染           │   │
 │  │  - 所有 tkinter 组件更新必须在此线程执行                         │   │
+│  │  - 带宽刷新: 从 client.get_stats()['total_bytes'] 每秒计算       │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                              ▲                                       │
 │                              │ 帧回调 _on_frame_received()            │
-│                              │ (在接收线程中调用, 快速深拷贝后返回)     │
+│                              │ (在各解码线程中并发调用, 受 _callbacks_lock 保护)│
 │                              │                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │  Recv Thread (接收线程, daemon=True)                           │   │
 │  │  - _recv_loop() 循环                                          │   │
-│  │  - socket.recv() → unpack_cmd_header → verify_header          │   │
-│  │  - _recv_exact(data_len) → _nv12_to_bgr → parse_frame_info    │   │
-│  │  - _frame_lock: _current_frame = bgr_image.copy() (深拷贝)     │   │
-│  │  - 调用所有已注册的帧回调 (_notify_frame)                       │   │
+│  │  - socket.recv() → _read_one_frame()                          │   │
+│  │  - 仅负责: 读帧头→验证→读数据体→统计带宽→分发到解码队列          │   │
+│  │  - queue.Queue(maxsize=2).put(body_data, frame_info)           │   │
 │  │  - 线程名: "HB-Recv"                                          │   │
-│  └──────────────────────────────────────────────────────────────┘   │
+│  └──────────────┬───────────────────────────────────────────────┘   │
+│                 │ queue.Queue(maxsize=2) × N                         │
+│     ┌───────────┼───────────┬───────────┐                           │
+│     ▼           ▼           ▼           ▼                           │
+│  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐                          │
+│  │Decode│  │Decode│  │Decode│  │Decode│  每路独立解码线程            │
+│  │Pipe7 │  │Pipe8 │  │Pipe9 │  │Pipe10│  (惰性创建, daemon=True)    │
+│  │      │  │      │  │      │  │      │                          │
+│  │ parse│  │ parse│  │ parse│  │ parse│  decoder.parse(data)       │
+│  │decode│  │decode│  │decode│  │decode│  decoder.decode(packet)     │
+│  │ →BGR │  │ →BGR │  │ →BGR │  │ →BGR │  to_ndarray(bgr24)         │
+│  └──┬───┘  └──┬───┘  └──┬───┘  └──┬───┘                          │
+│     └─────────┴─────────┴─────────┘  _notify_frame() 回调           │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │  Connect Thread (临时线程, 连接时创建, daemon=True)             │   │
@@ -673,7 +689,6 @@ while self._running:
 │  │  - 注册帧回调 _on_frame_received                               │   │
 │  │  - 调用 client.start() → connect() + 创建 Recv Thread          │   │
 │  │  - 完成后通过 root.after(0, callback) 切回主线程                 │   │
-│  │  - 线程生命周期: 连接成功/失败后自动结束                          │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -681,30 +696,11 @@ while self._running:
 ### 5.2 线程架构 (CLI 模式)
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           线程模型 (CLI 模式)                        │
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │  Main Thread (主线程)                                          │   │
-│  │  - 创建 CLIVideoClient 实例                                    │   │
-│  │  - 调用 client.start() → connect() + 创建 Recv Thread          │   │
-│  │  - while self.running: time.sleep(0.1) + 检查 is_connected    │   │
-│  │  - SIGINT 信号处理 (Ctrl+C)                                    │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-│                              ▲                                       │
-│                              │ 帧回调 on_frame()                      │
-│                              │ (在接收线程中调用)                      │
-│                              │                                      │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │  Recv Thread (接收线程, daemon=True)                           │   │
-│  │  - 同 GUI 模式的 Recv Thread                                   │   │
-│  │  - 帧回调: 打印统计 + cv2.imwrite (可选) + cv2.imshow (可选)    │   │
-│  │  - cv2.waitKey(1) 返回的按键用于控制退出/截图                    │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
+同 GUI 模式的线程模型 (接收线程 + 每路独立解码线程)。
+帧回调在解码线程中调用, 执行 cv2.imwrite / cv2.imshow 等操作。
 ```
 
-### 5.3 帧数据流 (完整管道)
+### 5.3 帧数据流 (完整管道, v1.6.0)
 
 ```
 TCP Socket (另一端: J6B 设备)
@@ -730,52 +726,62 @@ verify_header() ─────────── 检查 header_start==0xCCDDEEF
     │           └── 超时 → error_count++, continue
     │
     ▼ 成功
-检查 data_type ∈ {YUV_DATA(1), RAW_DATA(0)}
+检查 data_type ∈ {YUV_DATA(1), RAW_DATA(0), VIDEO_DATA(3)}
     │
     ├── 否 → _recv_exact(data_len) 丢弃数据体, continue
     │
     ▼ 是
-data_len == 0 ?
-    │
-    ├── 是 → continue (空帧)
-    │
-    ▼ 否
-_recv_exact(data_len) ───── 数据体 (NV12 原始字节)
+_recv_exact(data_len) ────── 数据体
     │
     ▼
-parse_frame_info() ───────── 提取 frame_info 字典
+parse_frame_info() ──────── 提取 width/height/stride/pipe_id 等
     │
     ▼
-_nv12_to_bgr() ───────────── Y/UV 分离 → stride 裁剪 → 上采样 → YUV→RGB (BT.601)
-    │                         返回: np.ndarray (height, width, 3), dtype=uint8, BGR 顺序
-    ▼
-frame_info + bgr_image
-    │
-    ├──▶ 更新统计: _lock → frame_count++
-    │
-    ├──▶ _notify_frame() → 遍历回调列表
-    │         │
-    │         ├──▶ GUI 回调: _on_frame_received()
-    │         │         _frame_lock → _pipe_frames[pipe_id] = (bgr_image.copy(), info)
-    │         │         各路 FPS 统计更新
-    │         │
-    │         └──▶ CLI 回调: on_frame()
-    │                   FPS 统计 → 终端打印 → cv2.imwrite (可选) → cv2.imshow (可选)
+total_bytes += 80 + data_len ── 带宽统计 (所有帧, 非仅回调帧)
     │
     ▼
-下一帧 (回到 _recv_exact(80))
+queue.Queue(maxsize=2).put((body_data, frame_info))
+    │ 分发到对应 pipe_id 的解码队列
+    │ (接收线程仅做 I/O, 立即返回继续读下一帧)
+    │
+    ▼
+【解码线程】queue.get()
+    │
+    ├── data_type == VIDEO_DATA(3)
+    │   └── decoder.parse(data) → packets
+    │       └── for each packet: decoder.decode(packet) → frames
+    │           └── for each frame: to_ndarray(bgr24) → BGR numpy array
+    │
+    └── data_type == YUV_DATA(1) / RAW_DATA(0)
+        └── _nv12_to_bgr(body, w, h, stride) → BGR numpy array
+    │
+    ▼
+frame_count += 1 (受 _lock 保护)
+    │
+    ▼
+_notify_frame(frame_info, bgr_image)
+    │ 线程安全回调 (受 _callbacks_lock 保护)
+    │
+    ▼
+【GUI/CLI 回调】_on_frame_received / on_frame
+    │ bgr_image.copy() 深拷贝 → _pipe_frames[pipe_id] = (...)
+    │
+    ▼
+【主线程 30ms】_update_display()
+    │ 取 _pipe_frames 引用 → _render_cell() → 绘制
 ```
 
-### 5.4 线程安全策略
+### 5.4 线程安全策略 (v1.6.0 更新)
 
 | 保护对象 | 锁 | 策略 |
 |----------|------|------|
-| `_pipe_frames` / `_available_pipes` | `_frame_lock` (GUI) | 接收线程写入时深拷贝 (`np.copy()`)，GUI 线程读取时再次深拷贝，双重隔离 |
-| `frame_count` / `error_count` | `_lock` (HBVideoClient) | 统计计数器，仅在 `_recv_loop` 和 `get_stats` 中访问 |
-| `_frame_callbacks` 列表 | 无锁 | 仅在连接前/断开后修改，接收期间只读遍历 |
+| `_pipe_frames` / `_available_pipes` | `_frame_lock` (GUI) | 解码线程写入时深拷贝 (`np.copy()`)，GUI 线程读取引用，`_frame_lock` 保护字典操作 |
+| `frame_count` / `error_count` / `total_bytes` | `_lock` (HBVideoClient) | 统计计数器，在接收线程和解码线程中访问, `_lock` 保护 |
+| `_frame_callbacks` 列表 | `_callbacks_lock` (HBVideoClient) | 多个解码线程并发调用 `_notify_frame`, 先快照列表再遍历 |
 | Socket 操作 | 无锁 | 仅接收线程访问 socket，主线程通过 `_running` 标志和 `stop()` 间接控制 |
+| `_pipe_queues` / `_pipe_threads` | 无锁 | 仅在 `_get_or_start_pipe_worker` (接收线程) 创建, 解码线程 daemon 运行 |
 
-> **关键设计**: 帧回调函数在接收线程中**同步**调用，回调内部必须尽快返回（只做深拷贝，不做耗时操作）。GUI 渲染在主线程中通过 30ms 定时器**异步**执行。
+> **关键设计**: 接收线程仅做 socket I/O + 分发, 不做解码。帧回调在各解码线程中**并发**调用 (`_callbacks_lock` 保护), 回调内部必须尽快返回（只做深拷贝，不做耗时操作）。GUI 渲染在主线程中通过 30ms 定时器**异步**执行。
 
 ---
 
@@ -1244,6 +1250,98 @@ HBVideoClient(
 )
 ```
 
+### 9.6 生成 Windows 可执行文件 (exe)
+
+使用 PyInstaller 将 Python 脚本打包为独立 exe（无需安装 Python 即可运行）。
+
+**环境准备**:
+```bash
+pip install pyinstaller
+```
+
+> **注意**: 如果系统同时安装了 Windows Store 版 Python 和官网版 Python，`pyinstaller` 命令可能指向 Store 版环境（缺少 numpy/av 等依赖）。务必使用 `py.exe -m PyInstaller` 确保使用正确的 Python 环境。
+
+**GUI 版本** (无控制台窗口, v1.6.0):
+```bash
+# 先清理旧构建产物 (重要: 避免缓存导致 --hidden-import 不生效)
+rmdir /s /q build dist 2>nul
+del *.spec 2>nul
+
+# 重新构建 (必须用 py.exe -m PyInstaller, 不能用裸 pyinstaller)
+py.exe -m PyInstaller --onefile --windowed --clean \
+  --name J6B_Video_GUI \
+  --collect-all numpy \
+  --collect-all PIL \
+  --collect-binaries av \
+  --collect-submodules av \
+  --hidden-import av \
+  --hidden-import av.codec \
+  --hidden-import av.packet \
+  --hidden-import av.frame \
+  hb_video_gui.py
+```
+
+**CLI 版本** (保留控制台):
+```bash
+py.exe -m PyInstaller --onefile \
+  --name J6B_Vide_CLI \
+  --collect-all numpy \
+  --collect-all PIL \
+  --collect-binaries av \
+  --collect-submodules av \
+  --hidden-import av \
+  --hidden-import av.codec \
+  --hidden-import av.packet \
+  --hidden-import av.frame \
+  hb_video_cli.py
+```
+
+**关键参数说明**:
+
+| 参数 | 作用 |
+|------|------|
+| `--onefile` | 打包为单个 exe 文件，方便分发 |
+| `--windowed` | GUI 模式隐藏控制台窗口（CLI 版本不加） |
+| `--clean` | 清理 PyInstaller 缓存，避免旧构建产物干扰 |
+| `--collect-all numpy` | **关键**: 收集 numpy 全部内容（含 `.pyd` C 扩展 + 子模块 + 数据文件）。`--hidden-import numpy` 不够——numpy 有数十个 C 扩展子模块需一并打包 |
+| `--collect-all PIL` | 同上，收集 Pillow 全部内容（含图像编解码 C 扩展） |
+| `--collect-binaries av` | **关键**: 收集 PyAV 的 FFmpeg 共享库 (`.dll`)，PyInstaller 默认检测不到 |
+| `--collect-submodules av` | 收集 `av.codec` / `av.packet` / `av.frame` 等 Cython 子模块 |
+| `--hidden-import av*` | 强制声明导入，防止 tree-shaking 误删 |
+
+### 9.7 一键构建脚本
+
+项目提供了两个批处理文件，双击即可生成 exe：
+
+| 脚本 | 目标 | 输出 |
+|------|------|------|
+| `PyToExe_gui.bat` | GUI 版本 (无控制台窗口) | `dist\J6B_Video_GUI.exe` |
+| `PyToExe_cli.bat` | CLI 版本 (保留控制台) | `dist\J6B_Vide_CLI.exe` |
+
+脚本自动完成：清理旧缓存 → PyInstaller 构建 → 显示结果。
+
+### 9.8 PyInstaller 踩坑实录
+
+以下为实际打包过程中遇到的问题和解决方案，供后续参考。
+
+| # | 错误现象 | 根因 | 解决方案 |
+|---|---------|------|---------|
+| 1 | `ModuleNotFoundError: No module named 'numpy'` | `--hidden-import numpy` 只声明顶层导入，numpy 内部有数十个 `.pyd` C 扩展子模块（`numpy.core`, `numpy.lib`, `numpy.linalg` 等）未被收集 | 改用 `--collect-all numpy`（= `--collect-binaries` + `--collect-submodules` + `--collect-datas`） |
+| 2 | 修复后仍报同样错误 | PyInstaller 首次运行生成 `.spec` 文件，后续构建复用缓存的旧 `.spec`，忽略命令行新增的 `--collect-all` 参数 | **每次重新构建前必须删除** `build\`、`dist\`、`*.spec` 三个目录/文件 |
+| 3 | `ERROR: Hidden import 'av.codec' not found` | 系统同时安装了 Windows Store 版 Python 和官网版 Python。PATH 中 `pyinstaller` 命令指向 Store 版环境——该环境下 numpy/Pillow/PyAV 都未安装 | 使用 `py.exe -m PyInstaller` 替代裸 `pyinstaller`，确保使用正确的 Python 环境 |
+| 4 | 批处理文件执行报 `'xxxx' 不是内部或外部命令` | (a) 文件行尾符为 LF (`\n`) 而非 Windows 要求的 CRLF (`\r\n`)，导致 cmd.exe 无法正确解析；(b) 中文 `!` 字符被错误转义为 `^^^!`（未启用 `enabledelayedexpansion` 时不需要转义）；(c) `>/dev/null` 是 Linux 语法，Windows 应使用 `>nul` | 以 UTF-8 BOM + CRLF 编码保存；`!` 直接使用不转义；`>/dev/null` → `>nul` |
+| 5 | 生成的 exe 大小仅 10MB（正常应 ~65MB） | PyInstaller 未正确收集 numpy 和 PyAV 的 DLL 文件（问题 #3 的次生现象） | 修复 #3 后自动解决 |
+| 6 | `--onefile` 打包的 exe 启动慢（1-3 秒） | exe 启动时需将内嵌的 PyAV FFmpeg DLL（约 20MB）解压到临时目录 | 可改用 `--onedir` 生成独立文件夹（分发需整个目录），或接受首次启动延迟 |
+
+**构建环境差异对照**：
+
+| 命令 | Python 版本 | 路径 | 包管理 |
+|------|------------|------|--------|
+| `pyinstaller` (PATH) | 3.13.14 (Win Store) | `C:\Program Files\WindowsApps\...` | 缺少 numpy/av/PIL |
+| `py.exe -m PyInstaller` | 3.14 (官网安装) | `C:\Python314\` | 完整依赖 |
+
+> **总结**: 标准构建流程 = `py.exe -m PyInstaller` + `--collect-all numpy/PIL` + `--collect-binaries av` + 删缓存。参照 `PyToExe_gui.bat` 执行即可避免上述所有坑。
+
 ---
 
 ## 10. 错误处理与异常恢复
@@ -1400,11 +1498,12 @@ Camera_player/
 - 如果是 RAW 数据，需要使用不同的解码路径（`enable_raw=True`）
 - 检查色彩是否偏绿/偏紫 → 可能是 UV 平面顺序错误
 
-**Q: FPS 很低**
+**Q: FPS 很低 / 画面卡顿**
 
-- 检查网络带宽（1920×1080 NV12 @ 30fps ≈ 95 MB/s）
-- 确认 PC 端 CPU 性能足够（NV12→BGR 转换需要 CPU 资源）
-- 可尝试降低设备端输出分辨率或使用 stride=width
+- (H.264 模式) 确认使用 v1.6.0+ 代码: 早期版本 `av.Packet(data)` 直送导致 AVERROR_INVALIDDATA, 大量帧跳过解码
+- (H.264 模式) 确认 PyAV 已安装: `pip install av`
+- 检查网络带宽: NV12 原始流带宽极高 (~356 MB/s 4路), 建议使用 H.264 模式
+- (v1.6.0) 当前解码速率约 100fps (4路各 25fps), 匹配 J6B 实际输出, 硬件要求低 (i3/Ryzen 3 级别足够)
 - 检查是否在帧回调中执行了耗时操作
 
 **Q: Ubuntu 上 GUI 无法启动**
@@ -1415,7 +1514,7 @@ Camera_player/
 
 ### 11.6 扩展开发建议
 
-1. **支持 H.264/H.265 解码**: ✅ **已实现 (v1.4.0)**。`_recv_loop` 中自动识别 `VIDEO_DATA` (3) 帧, 调用 `_decode_h264()` 通过 PyAV 软解码为 BGR。详见 [第 12 节](#12-h264-编解码链路)。
+1. **支持 H.264/H.265 解码**: ✅ **已实现 (v1.4.0, v1.6.0 完善)**。每路独立解码线程 + `decoder.parse()` NAL 单元解析 + FFmpeg auto 多线程。详见 [第 12 节](#12-h264-编解码链路)。
 2. **多路视频同时显示**: ✅ 已实现。田字格自动布局，所有活跃通道通过同一 TCP 连接交错接收后同时渲染，每路视频顶部叠加信息条。
 3. **录制功能**: 在帧回调中使用 `cv2.VideoWriter` 保存为 MP4 文件
 4. **AI 推理集成**: 在帧回调中将帧放入队列，由独立工作线程调用 ONNX Runtime / OpenCV DNN 进行目标检测
@@ -1447,7 +1546,7 @@ PC:  _recv_loop → VIDEO_DATA(3) → _decode_h264() PyAV → BGR
 
 ### 12.3 PC 端解码实现
 
-**自动类型识别** (`_recv_loop` 第 267-285 行):
+**自动类型识别** (`_decode_one_frame` in `_pipe_decode_loop`):
 
 ```python
 if data_type == DataType.VIDEO_DATA:
@@ -1459,12 +1558,13 @@ else:
         frame_info['width'], frame_info['height'], frame_info['stride'])
 ```
 
-**PyAV 解码器管理** (`_get_h264_decocer` / `_decode_h264`):
+**PyAV 解码器管理** (`_get_h264_decoder` / `_decode_h264`, v1.6.0 修正):
 
-- 每个 `pipe_id` 维护独立的 `av.CodecContext` 实例
-- `decoder.parse(data)` 将 AnnexB NAL 单元解析为 packet
-- `decoder.decode(packet)` 输出 VideoFrame → `to_ndarray(format='bgr24')`
-- 返回 `None` 表示当前数据不足以产出一帧 (解码器自动缓冲)
+- 每个 `pipe_id` 维护独立的 `av.CodecContext` 实例 (在专属解码线程中运行)
+- `decoder.parse(data)` 将 Annex B 字节流拆分为 NAL 单元对齐的 Packet 列表 (内部 `av_parser_parse2()`)
+- `decoder.decode(packet)` 逐 packet 输出 VideoFrame → `to_ndarray(format='bgr24')`
+- 解码器配置: `thread_count=0` (FFmpeg auto 多线程), `flags|=4` (AV_CODEC_FLAG_OUTPUT_CORRUPT)
+- **重要**: 不能使用 `av.Packet(data)` 直送解码器 — 当解码器尚无 SPS/PPS 上下文时, `avcodec_send_packet()` 对所有帧 (包括后续含 SPS/PPS 的 IDR 帧) 一律返回 AVERROR_INVALIDDATA, 导致解码器永久无法初始化
 
 **依赖**:
 
@@ -1634,38 +1734,61 @@ python3 hb_video_gui.py
 | 7 | 运行 | 同上 INVALID_PARAMS | `vbv_buffer_size=0` (memset后未赋值), 不在有效范围 [10,3000] | 先 `hb_mm_mc_get_rate_control_config` 取FW默认值, 再覆盖全部 17 个码率控制字段 |
 | 8 | 运行 | 编码器初始化OK, 输出 1-2 帧后 `HB_MEDIA_ERR_UNKNOWN` | `external_frame_buf=1` 零拷贝模式给编码器填了 NV12 buffer, 但 CIM DDR 实际输出 YUV422→编码器按 NV12 读导致数据错位 | 改为 `external_frame_buf=0` + memcpy NV12 数据到编码器内部 buffer |
 | 9 | 运行 | 同上 UNKNOWN | 连续 memcpy 未处理 stride 对齐差异 (CIM stride=1696 vs Encoder stride 可能对齐到 32/64) | 逐行 memcpy, 每行只拷贝 `width` 字节, 跳过 padding |
-| 10 | 延迟 | PC 端播放有数秒延迟 | PyAV `decoder.parse()` 内部流式缓冲, 碎片 NAL 单元被缓冲等待拼帧 | `decoder.parse()` → `av.Packet(data)` 直送解码器 |
+| 10 | 延迟 | PC 端播放有数秒延迟 | ~~PyAV `decoder.parse()` 内部流式缓冲~~ **(v1.6.0 修正: 此结论有误, 真正原因是 #14)** | ~~`decoder.parse()` → `av.Packet(data)` 直送~~ |
 | 11 | 延迟 | 编码器端 ~3 秒缓冲 | `vbv_buffer_size=3000ms` 预留大缓冲平滑码率 | 逐步压缩至 300ms (`vfv=300ms, I帧 120KB 安全`) |
 | 12 | PC | GUI 显示「芯片版本: J2」(应为 J6B) | `TOOL_VERSION=2` 直接拼接到 `J{chip_ver}` | 新增 `CHIP_NAMES` 映射字典 |
 | 13 | PC | `SyntaxError: f-string expr不能包含反斜杠` | Python 3.11-: f-string 内不能有 `\"` | 提取 chip_name 为独立变量 |
+| 14 | PC | `AVERROR_INVALIDDATA` 满屏错误, 所有帧解码失败 (v1.6.0 发现) | `av.Packet(data)` 直送 → `avcodec_send_packet()` 在解码器无 SPS/PPS 上下文时拒绝所有帧, 含后续 SPS/PPS 的 IDR 帧也被拒绝 → 解码器永久无法初始化 | 回归 `decoder.parse(data)` → NAL 单元逐个 `decoder.decode(packet)`, SPS/PPS 能正确初始化解码器 |
+| 15 | PC | 显示帧率仅 ~2fps (v1.6.0 发现) | 排空机制每周期解码 N 帧但只推送最后 1 帧到回调 | 移除排空, 逐帧解码推送, 解码速率匹配输入速率 (TCP 背压自然限流) |
+| 16 | PC | 带宽显示 ~1.4Mbps, 实际 ~13Mbps (v1.6.0 发现) | 带宽计数器在回调中, 排空丢弃的帧不计数 | 移至 `_read_one_frame()` 数据读取点, 统计所有帧 |
+| 17 | PC | disconnect 时 `NoneType` crash (v1.6.0 发现) | 线程竞态: `_sock=None` 后接收线程仍访问 | 加 `_running` 和 `_sock is not None` 检查 |
 
-### 14.2 关键发现: 延迟瓶颈在 PC 端而非 J6B 编码器
+### 14.2 关键发现: 延迟瓶颈根因修正 (v1.6.0)
 
-**实验证据**:
-- **实验 A**: J6B 启动流后, 移动摄像头→立即连 PC GUI → 显示移动后的画面。**结论: J6B 输出实时**。
-- **实验 B**: PC 已连接播放一段时间后, 移动摄像头→需等数秒才在 PC 端看到变化。**结论: PC 端缓冲累积**。
+> **v1.5.0 的结论 (14.2) 有误**。当时的分析认为延迟来自 `decoder.parse()` 的流式缓冲, 因此改用 `av.Packet(data)` 直送。但 v1.6.0 调试发现 `av.Packet(data)` 直送会导致更严重的问题 — 解码器在无 SPS/PPS 上下文时对所有帧永久返回 AVERROR_INVALIDDATA。
 
-**根因**: PyAV 的 `CodecContext.parse()` 是流式解析器, 把零碎的 H.264 AnnexB 数据缓存并等待完整 NAL 单元才输出。长时间运行后, parse 内部缓冲持续保持 N 帧的 feed-decode 偏移, 导致「看到的是 N 帧前的画面」。
+**v1.6.0 正确根因**:
+- 真正导致画面延迟的是两个叠加 bug:
+  1. `av.Packet(data)` 直送 → AVERROR_INVALIDDATA → 解码器无法初始化
+  2. 排空机制过度丢弃帧 → 显示帧率从 25fps 降至 2fps (画面卡顿被感知为"延时")
+- `decoder.parse(data)` 本身 **不会** 导致渐进式延迟 — v1.5.0 观察到的数秒延迟是 AVERROR_INVALIDDATA 导致大多数帧解码失败, 只能等 IDR 帧侥幸通过
 
-**最终方案**: `av.Packet(data)` 直接把完整帧(接收线程已按 80B 帧头 + data_len 拼好一整帧)喂给解码器, **零缓冲**。配合 `thread_count=1` 单线程解码, 总延迟从数秒降到 ~200ms 级别。
+**最终方案 (v1.6.0)**:
+- `decoder.parse(data)` → 逐个 NAL 单元 `decoder.decode(packet)` — SPS/PPS 正确初始化解码器
+- 移除排空机制 — 解码速率 (100fps) 匹配输入速率 (100fps), TCP 背压自然限流
+- 10 小时压力测试: 解码速率恒定 100fps, 零错误, 无延迟累积
 
-### 14.3 PC 端数据流 (无冗余拷贝版)
+### 14.3 PC 端数据流 (v1.6.0 并行解码版)
 
 ```
 TCP recv(80B 帧头 + H.264 码流)
-  → av.Packet(data)                    // 无需 parse, 直送
-  → decoder.decode(packet)             // FFmpeg VPU 软件解码
-  → frame.to_ndarray(bgr24)            // ①唯一的图像拷贝 (PyAV 内部 buffer 复用)
-  → self._pipe_frames[pipe_id] = (...)  // 引用传递, 覆盖旧帧
-  → _update_display()                  // 取引用 (不加锁拷贝)
+  → _read_one_frame()                   // 仅读取不解码, 统计 total_bytes
+  → queue.Queue(maxsize=2).put()        // 分发到对应 pipe 的解码线程
+  → (解码线程) decoder.parse(data)      // av_parser_parse2 拆分 NAL 单元
+  → (解码线程) decoder.decode(packet)   // FFmpeg 软件解码 (thread_count=auto)
+  → (解码线程) frame.to_ndarray(bgr24)  // ①唯一的图像拷贝 (PyAV 内部 buffer 复用)
+  → (解码线程) _notify_frame()          // 线程安全回调 (_callbacks_lock)
+  → self._pipe_frames[pipe_id] = (...)  // 引用传递, 覆盖旧帧 (受 _frame_lock 保护)
+  → _update_display() (主线程 30ms)     // 取引用 (不加锁拷贝)
   → BGR[::-1] view → PIL → ImageTk     // ②渲染拷贝
 ```
 
-### 14.4 长时稳定性保障
+### 14.4 长时稳定性保障 (v1.6.0 更新)
 
 | 层面 | 措施 |
 |------|------|
 | 内存 | `_on_frame_received` 只保留最新帧(覆盖旧帧, GC自动回收), `_update_display` 零拷贝引用传递 |
-| 解码 | 每路独立 `av.CodecContext`, 单路异常不影响其他; `except→return None`, 下帧自动恢复 |
-| TCP | `_sync_to_header` 魔数扫描+滑动窗口, 断流自动重同步; `select` + timeout 防止阻塞 |
-| 编码器 | `VENC_DEBUG` 宏开关, 各路 feed/output/error 独立计数, STAT 每 5 秒汇报
+| 解码 | 每路独立 `av.CodecContext` + 独立线程, 单路异常不影响其他; `except→continue`, 下帧自动恢复; Queue maxsize=2 提供背压防止内存膨胀 |
+| TCP | `_sync_to_header` 魔数扫描+滑动窗口, 断流自动重同步; `settimeout(1.0)` 防止阻塞; disconnect 检查 `_running` 和 `_sock is not None` 防止竞态崩溃 |
+| 编码器 | `VENC_DEBUG` 宏开关, 各路 feed/output/error 独立计数, STAT 每 5 秒汇报 |
+| 线程安全 | `_callbacks_lock` 保护回调列表; `_lock` 保护 `frame_count/error_count/total_bytes`; `_frame_lock` (GUI 侧) 保护 `_pipe_frames` |
+
+### 14.5 v1.6.0 性能验证
+
+| 测试 | 时长 | 解码速率 | 每路帧率 | 错误 | 结论 |
+|------|------|---------|---------|------|------|
+| 稳定性测试 | 60s | 100.0 fps | 24.8 fps ×4 | 0 | 帧率无衰减 |
+| 压力测试 | 5min | 100.0 fps | 25.0 fps ×4 | 0 | 每30s采样均恒定 |
+| 长期验证 | 10h | 100.0 fps | 25.0 fps ×4 | 0 | 视频保持同步 |
+
+CPU 占用: i9-13900H 仅用 ~6% (1.2 核/20 核), 任何入门级 CPU 均可满足。内存: <100 MB。

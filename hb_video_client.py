@@ -36,6 +36,7 @@ NV12 格式:
 
 import socket
 import struct
+import queue
 import threading
 import time
 import logging
@@ -98,16 +99,22 @@ class HBVideoClient:
         self._running = False
         self._recv_thread: threading.Thread | None = None
 
-        # 帧回调
+        # 帧回调 (多线程访问, 需 _callbacks_lock 保护)
         self._frame_callbacks: list = []
+        self._callbacks_lock = threading.Lock()
 
         # 统计信息
         self.frame_count = 0
         self.error_count = 0
+        self.total_bytes = 0   # 累计接收字节数 (含所有帧, 用于带宽计算)
         self._lock = threading.Lock()
 
         # H.264 解码器 (按 pipe_id 独立, 仅 VIDEO_DATA 时使用)
         self._h264_decoders: dict[int, 'av.CodecContext'] = {}
+
+        # 每路独立解码线程 (并行解码, 突破单线程串行瓶颈)
+        self._pipe_queues: dict[int, queue.Queue] = {}
+        self._pipe_threads: dict[int, threading.Thread] = {}
 
     # ------------------------------------------------------------------
     # 连接管理
@@ -145,8 +152,10 @@ class HBVideoClient:
             return False
 
     def disconnect(self):
-        """断开连接."""
+        """断开连接, 等待所有解码线程退出."""
         self._running = False
+
+        # 关闭 socket 使接收线程退出
         if self._sock:
             try:
                 self._sock.shutdown(socket.SHUT_RDWR)
@@ -154,6 +163,18 @@ class HBVideoClient:
                 pass
             self._sock.close()
             self._sock = None
+
+        # 等待接收线程退出
+        if self._recv_thread and self._recv_thread.is_alive():
+            self._recv_thread.join(timeout=2.0)
+
+        # 等待各解码线程退出
+        for pipe_id, t in list(self._pipe_threads.items()):
+            if t.is_alive():
+                t.join(timeout=2.0)
+        self._pipe_threads.clear()
+        self._pipe_queues.clear()
+
         # 清理 H.264 解码器 (下次连接时重建)
         self._h264_decoders.clear()
         logger.info("已断开连接")
@@ -167,24 +188,21 @@ class HBVideoClient:
     # ------------------------------------------------------------------
 
     def register_frame_callback(self, callback):
-        """
-        注册帧回调函数.
-
-        callback 签名: callback(frame_info: dict, bgr_image: np.ndarray)
-
-        Args:
-            callback: 回调函数
-        """
-        self._frame_callbacks.append(callback)
+        """注册帧回调函数 (线程安全)."""
+        with self._callbacks_lock:
+            self._frame_callbacks.append(callback)
 
     def remove_frame_callback(self, callback):
-        """移除帧回调."""
-        if callback in self._frame_callbacks:
-            self._frame_callbacks.remove(callback)
+        """移除帧回调 (线程安全)."""
+        with self._callbacks_lock:
+            if callback in self._frame_callbacks:
+                self._frame_callbacks.remove(callback)
 
     def _notify_frame(self, frame_info: dict, bgr_image: np.ndarray):
-        """通知所有注册的回调."""
-        for cb in self._frame_callbacks:
+        """通知所有注册的回调 (会被多个解码线程并发调用)."""
+        with self._callbacks_lock:
+            callbacks = list(self._frame_callbacks)
+        for cb in callbacks:
             try:
                 cb(frame_info, bgr_image)
             except Exception as e:
@@ -209,87 +227,138 @@ class HBVideoClient:
             data += chunk
         return data
 
+    def _read_one_frame(self) -> tuple[bytes, dict] | None:
+        """
+        从 socket 读取一帧 (header + body), 仅读取不解码.
+
+        Returns:
+            (body_data, frame_info) 或 None
+        """
+        # 1. 接收帧头
+        header_data = self._recv_exact(CMD_HEADER_SIZE)
+        if header_data is None:
+            return None
+
+        # 2. 解包帧头
+        try:
+            header_fields = unpack_cmd_header(header_data)
+        except struct.error:
+            logger.warning("帧头解包失败, 跳过")
+            return None
+
+        # 3. 验证魔数
+        if not verify_header(header_fields):
+            synced = self._sync_to_header(header_data)
+            if not synced:
+                self.error_count += 1
+            return None
+
+        data_len = header_fields[IDX_LEN]
+        data_type = header_fields[IDX_TYPE]
+
+        # 4. 跳过非视频数据
+        if data_type not in (DataType.YUV_DATA, DataType.RAW_DATA,
+                              DataType.VIDEO_DATA):
+            if data_len > 0:
+                self._recv_exact(data_len)
+            return None
+
+        # 5. 接收数据体
+        if data_len == 0:
+            return None
+        body_data = self._recv_exact(data_len)
+        if body_data is None:
+            self.error_count += 1
+            return None
+
+        # 6. 解析帧信息 + 统计带宽
+        frame_info = parse_frame_info(header_fields)
+        with self._lock:
+            self.total_bytes += CMD_HEADER_SIZE + data_len
+        return (body_data, frame_info)
+
+    def _decode_one_frame(self, body_data: bytes, frame_info: dict,
+                          pipe_id: int, data_type: int) -> np.ndarray | None:
+        """解码单帧数据 → BGR (在解码线程中调用)."""
+        if data_type == DataType.VIDEO_DATA:
+            return self._decode_h264(body_data, pipe_id, frame_info)
+        else:
+            try:
+                return self._nv12_to_bgr(
+                    body_data,
+                    frame_info['width'],
+                    frame_info['height'],
+                    frame_info['stride'],
+                )
+            except Exception as e:
+                logger.error(f"Pipe {pipe_id}: NV12转BGR失败: {e}")
+                return None
+
+    def _get_or_start_pipe_worker(self, pipe_id: int):
+        """获取或创建指定 pipe 的解码队列+线程 (惰性创建)."""
+        if pipe_id not in self._pipe_queues:
+            q = queue.Queue(maxsize=2)  # 小容量 → 解码慢时快速背压
+            self._pipe_queues[pipe_id] = q
+            t = threading.Thread(
+                target=self._pipe_decode_loop,
+                args=(pipe_id, q),
+                name=f"HB-Decode-Pipe{pipe_id}",
+                daemon=True,
+            )
+            self._pipe_threads[pipe_id] = t
+            t.start()
+            logger.debug(f"Pipe {pipe_id}: 解码线程已创建")
+        return self._pipe_queues[pipe_id]
+
+    def _pipe_decode_loop(self, pipe_id: int, q: queue.Queue):
+        """
+        单路解码线程主循环.
+
+        从队列取出原始帧数据 → 解码 → 推送回调.
+        多路并行: Pipe 7/8/9/10 各一个独立线程, 利用多核 CPU 并行解码.
+        """
+        while self._running:
+            try:
+                body_data, frame_info = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            data_type = frame_info['type']
+            bgr_image = self._decode_one_frame(
+                body_data, frame_info, pipe_id, data_type)
+
+            if bgr_image is not None:
+                with self._lock:
+                    self.frame_count += 1
+                self._notify_frame(frame_info, bgr_image)
+
+        logger.debug(f"Pipe {pipe_id}: 解码线程退出")
+
     def _recv_loop(self):
-        """接收线程主循环."""
+        """
+        接收线程主循环 — 仅负责从 socket 读取帧并分发到各 pipe 的解码队列.
+
+        解码由每路独立的 _pipe_decode_loop 线程并行处理, 突破单线程串行瓶颈。
+        队列 maxsize=2 提供自然背压: 某路解码慢时 put() 阻塞 → TCP recv 阻塞 →
+        J6B 发送端降速, 全局流控。
+        """
         self._running = True
-        # 接收超时设为 1 秒，以便检查 _running 标志
         self._sock.settimeout(1.0)
 
         while self._running:
-            # 1. 接收 80 字节帧头
-            header_data = self._recv_exact(CMD_HEADER_SIZE)
-            if header_data is None:
+            result = self._read_one_frame()
+            if result is None:
                 if not self._running:
                     break
                 self.error_count += 1
                 continue
 
-            # 2. 解包帧头
-            try:
-                header_fields = unpack_cmd_header(header_data)
-            except struct.error:
-                logger.warning("帧头解包失败, 跳过")
-                self.error_count += 1
-                continue
+            body_data, frame_info = result
+            pipe_id = frame_info['pipe_id']
 
-            # 3. 验证魔数
-            if not verify_header(header_fields):
-                # 可能是字节对齐问题，尝试同步
-                logger.debug("帧头魔数不匹配，尝试同步...")
-                synced = self._sync_to_header(header_data)
-                if not synced:
-                    self.error_count += 1
-                continue
-
-            data_len = header_fields[IDX_LEN]
-            data_type = header_fields[IDX_TYPE]
-
-            # 4. 跳过非 YUV/RAW/VIDEO 数据
-            if data_type not in (DataType.YUV_DATA, DataType.RAW_DATA,
-                                  DataType.VIDEO_DATA):
-                # 读取并丢弃数据体
-                if data_len > 0:
-                    self._recv_exact(data_len)
-                continue
-
-            # 5. 接收数据体
-            if data_len == 0:
-                continue
-            body_data = self._recv_exact(data_len)
-            if body_data is None:
-                self.error_count += 1
-                continue
-
-            # 6. 解析帧信息
-            frame_info = parse_frame_info(header_fields)
-
-            # 7. 解码图像数据
-            if data_type == DataType.VIDEO_DATA:
-                # H.264 码流 → PyAV 解码
-                bgr_image = self._decode_h264(
-                    body_data, frame_info['pipe_id'], frame_info)
-                if bgr_image is None:
-                    continue  # 解码器尚需更多数据, 等待下一帧
-            else:
-                # NV12 → BGR 转换 (原有逻辑)
-                try:
-                    bgr_image = self._nv12_to_bgr(
-                        body_data,
-                        frame_info['width'],
-                        frame_info['height'],
-                        frame_info['stride'],
-                    )
-                except Exception as e:
-                    logger.error(f"NV12转BGR失败: {e}")
-                    self.error_count += 1
-                    continue
-
-            # 8. 更新统计
-            with self._lock:
-                self.frame_count += 1
-
-            # 9. 通知回调
-            self._notify_frame(frame_info, bgr_image)
+            # 分发到对应 pipe 的解码线程
+            q = self._get_or_start_pipe_worker(pipe_id)
+            q.put((body_data, frame_info))  # 阻塞直到解码线程消费 (背压)
 
         logger.info("接收线程退出")
 
@@ -374,39 +443,52 @@ class HBVideoClient:
             )
         if pipe_id not in self._h264_decoders:
             codec = av.CodecContext.create('h264', 'r')
-            codec.thread_count = 1  # 低延迟: 关闭多线程帧缓冲
+            codec.thread_count = 0  # 0=auto (FFmpeg 多线程, 利用多核CPU, 绕过 GIL)
+            # 启用错误恢复: 缺失参考帧或数据损坏时尽量输出画面而非报错
+            codec.flags |= 4  # AV_CODEC_FLAG_OUTPUT_CORRUPT
             self._h264_decoders[pipe_id] = codec
-            logger.info(f"Pipe {pipe_id}: 已创建低延迟 H.264 解码器")
+            logger.info(f"Pipe {pipe_id}: 已创建 H.264 解码器 (thread_count=auto)")
         return self._h264_decoders[pipe_id]
 
     def _decode_h264(self, data: bytes, pipe_id: int,
                        frame_info: dict) -> np.ndarray | None:
         """
-        将 H.264 AnnexB 码流解码为 BGR 图像.
+        将 H.264 Annex B 码流解码为 BGR 图像.
 
-        PyAV 内部自动缓冲数据, 一次 parse+decode 可能输出 0 或 N 帧。
-        只返回当前解码出的最后一帧 (通常每次调用对应 1 帧)。
+        使用 decoder.parse() 将 Annex B 字节流拆分为 NAL 单元对齐的 Packet,
+        再逐个送入 decoder.decode()。parse() 内部 av_parser_parse2() 自动
+        提取 SPS/PPS 并更新解码器内部状态 — 这解决了 av.Packet(data) 直送时
+        解码器因缺少上下文将首个 P-frame 之前所有帧都拒绝的问题。
+
+        排空机制 (_recv_loop 中的 _read_and_decode_one_frame non-blocking 批量调用)
+        确保长期运行时不会因 parser 内部缓冲渐进式累积延迟。
 
         Args:
-            data:       H.264 AnnexB 码流数据
+            data:       H.264 Annex B 码流数据
             pipe_id:    Pipeline 编号
             frame_info: 帧信息字典
 
         Returns:
-            BGR 格式 numpy 数组, 或 None (解码器需要更多数据)
+            BGR 格式 numpy 数组, 或 None
         """
         decoder = self._get_h264_decoder(pipe_id)
 
         try:
-            # send raw packet directly (skip parse buffering)
-            packet = av.Packet(data)
-            frames = decoder.decode(packet)
+            packets = decoder.parse(data)
+            if not packets:
+                return None  # parser 缓冲中, 等待更多数据拼接完整 NAL 单元
+
             bgr = None
-            for frame in frames:
-                bgr = frame.to_ndarray(format='bgr24')
+            for packet in packets:
+                try:
+                    frames = decoder.decode(packet)
+                    for frame in frames:
+                        bgr = frame.to_ndarray(format='bgr24')
+                except Exception:
+                    continue  # 单个 packet 解码失败, 跳过继续
             return bgr
         except Exception as e:
-            logger.error(f"Pipe {pipe_id}: H.264 解码失败: {e}")
+            logger.debug(f"Pipe {pipe_id}: 解码异常: {e}")
             return None
 
     # ------------------------------------------------------------------
@@ -502,16 +584,14 @@ class HBVideoClient:
         return True
 
     def stop(self):
-        """停止视频流接收."""
-        self._running = False
-        if self._recv_thread and self._recv_thread.is_alive():
-            self._recv_thread.join(timeout=3.0)
+        """停止视频流接收 (disconnect 会等待所有线程退出)."""
         self.disconnect()
 
     def get_stats(self) -> dict:
-        """获取统计信息."""
+        """获取统计信息 (包含所有帧的实际接收字节数)."""
         with self._lock:
             return {
                 'frame_count': self.frame_count,
                 'error_count': self.error_count,
+                'total_bytes': self.total_bytes,
             }

@@ -57,9 +57,9 @@ class HBVideoGUI:
         self._pipe_fps_count: dict[int, int] = defaultdict(int)
         self._fps_start_time = time.time()
 
-        # 带宽统计 (帧接收线程累加, 主线程每秒读取清零)
-        self._bytes_received = 0
-        self._bandwidth_bytes = 0
+        # 带宽统计 (从 client.get_stats()['total_bytes'] 读取实际接收字节数)
+        self._bw_last_bytes = 0
+        self._bw_last_time = time.time()
         self._bw_lock = threading.Lock()
 
         # 当前选中的 pipe (用于截图 + 右侧详情面板)
@@ -366,6 +366,8 @@ class HBVideoGUI:
         self._log("已断开连接")
         self.fps_label.config(text="FPS: --")
         self.bw_label.config(text="带宽: --")
+        self._bw_last_bytes = 0
+        self._bw_display = 0
 
         with self._frame_lock:
             self._pipe_frames.clear()
@@ -434,10 +436,6 @@ class HBVideoGUI:
         # 各路 FPS 统计
         self._pipe_fps_count[pipe_id] = self._pipe_fps_count.get(pipe_id, 0) + 1
 
-        # 带宽统计 (帧数据量 + 80B 协议帧头)
-        with self._bw_lock:
-            self._bytes_received += frame_info['data_len'] + 80
-
         # 全局 FPS 统计
         now = time.time()
         elapsed = now - self._fps_start_time
@@ -446,10 +444,6 @@ class HBVideoGUI:
             for pid, count in self._pipe_fps_count.items():
                 self._pipe_fps[pid] = count / elapsed
             self._pipe_fps_count.clear()
-            # 更新带宽
-            with self._bw_lock:
-                self._bandwidth_bytes = self._bytes_received
-                self._bytes_received = 0
             self._fps_start_time = now
 
     # ------------------------------------------------------------------
@@ -487,11 +481,23 @@ class HBVideoGUI:
             text=f"总FPS: {total_fps:.1f}" if total_fps > 0 else "FPS: --"
         )
 
-        # 更新带宽标签 (Mbps)
-        with self._bw_lock:
-            bw_mbps = self._bandwidth_bytes * 8 / 1_000_000
-        if bw_mbps > 0:
-            self.bw_label.config(text=f"带宽: {bw_mbps:.1f} Mbps")
+        # 更新带宽标签 (Mbps) — 从 client 读取实际接收字节数计算
+        if self.client and self.client.is_connected:
+            stats = self.client.get_stats()
+            now = time.time()
+            with self._bw_lock:
+                delta_bytes = stats['total_bytes'] - self._bw_last_bytes
+                delta_t = now - self._bw_last_time
+                if delta_t >= 1.0:
+                    bw_mbps = delta_bytes * 8 / delta_t / 1_000_000
+                    self._bw_last_bytes = stats['total_bytes']
+                    self._bw_last_time = now
+                    self._bw_display = bw_mbps
+                bw_mbps = getattr(self, '_bw_display', 0)
+            if bw_mbps > 0:
+                self.bw_label.config(text=f"带宽: {bw_mbps:.1f} Mbps")
+            else:
+                self.bw_label.config(text="带宽: --")
         else:
             self.bw_label.config(text="带宽: --")
 
