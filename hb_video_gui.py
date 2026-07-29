@@ -284,7 +284,8 @@ class HBVideoGUI:
         canvas = tk.Canvas(cell_frame, bg="black", highlightthickness=0)
         canvas.pack(fill=tk.BOTH, expand=True)
 
-        cell = {"frame": cell_frame, "canvas": canvas, "photo": None}
+        cell = {"frame": cell_frame, "canvas": canvas, "photo": None,
+                "last_frame_id": -1}
         self._pipe_cells[pipe_id] = cell
 
         self._arrange_grid()
@@ -506,6 +507,12 @@ class HBVideoGUI:
     def _render_cell(self, pipe_id: int, bgr_image: np.ndarray, frame_info: dict):
         """渲染单路视频到对应网格单元，上部叠加信息条."""
         cell = self._pipe_cells[pipe_id]
+
+        # 跳帧: 如果 frame_id 未变, 跳过整个渲染管线 (GPU 纹理上传 + resize + 重绘)
+        fid = frame_info.get('frame_id', -1)
+        if fid == cell["last_frame_id"]:
+            return
+
         canvas = cell["canvas"]
 
         canvas_w = canvas.winfo_width()
@@ -531,6 +538,7 @@ class HBVideoGUI:
         pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
 
         cell["photo"] = ImageTk.PhotoImage(pil_img)
+        cell["last_frame_id"] = fid
 
         # 居中绘制视频画面
         x = (canvas_w - new_w) // 2
