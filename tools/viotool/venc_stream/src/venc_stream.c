@@ -29,6 +29,7 @@
 #include "hb_vin_data_info.h"     /* hb_cam_get_data / hb_cam_free_data */
 #include "hb_vio_interface.h"     /* hb_vio_init / hb_vio_start_pipeline */
 #include "hb_tool_server.h"       /* hb_tool_start_transfer / hb_tool_send_video_pic */
+#include "hb_vpm_data_info.h"     /* HB_VIO_PYM_DATA_V3, pym_buffer_v3_t */
 
 /* ======================================================================
  * 可配置参数 (按实际场景修改)
@@ -70,6 +71,7 @@ typedef struct {
 
     pthread_t        feed_tid;      /* 取帧线程 */
     pthread_t        output_tid;    /* 取码流+发送线程 */
+    pthread_t        pym_tid;       /* PYM 消费线程 (驱动 ISP 统计→R-Core 通路) */
 
     /* 统计 */
     uint64_t         frame_count;
@@ -259,6 +261,32 @@ static void *output_thread(void *arg)
 
     printf("Pipe %d: output thread exit (frames=%lu)\n",
            ch->pipe_id, (unsigned long)ch->frame_count);
+    return NULL;
+}
+
+/* ======================================================================
+ * PYM 消费线程 (每路独立)
+ * 循环: hb_vio_get_data(PYM_V3) → hb_vio_free_pymbuf
+ * 不处理数据本身, 仅通过消费 PYM buffer 来驱动 ISP 驱动完成
+ * PYM DMA 配置和 R-Core 共享内存通路, 保障 AE/AWB/AF 统计正常。
+ * ====================================================================== */
+static void *pym_thread(void *arg)
+{
+    enc_channel_t *ch = (enc_channel_t *)arg;
+    pym_buffer_v3_t pym_buf;
+    int ret;
+
+    while (ch->running) {
+        memset(&pym_buf, 0, sizeof(pym_buf));
+        ret = hb_vio_get_data(ch->pipe_id, HB_VIO_PYM_DATA_V3, &pym_buf);
+        if (ret == 0) {
+            hb_vio_free_pymbuf(ch->pipe_id, HB_VIO_PYM_DATA_V3, &pym_buf);
+        } else {
+            usleep(5000);  /* 5ms 后重试 */
+        }
+    }
+
+    printf("Pipe %d: pym thread exit\n", ch->pipe_id);
     return NULL;
 }
 
@@ -493,6 +521,7 @@ int main(int argc, char *argv[])
                 g_ch[j].running = 0;
                 pthread_join(g_ch[j].feed_tid, NULL);
                 pthread_join(g_ch[j].output_tid, NULL);
+                pthread_join(g_ch[j].pym_tid, NULL);
                 release_encoder(&g_ch[j]);
             }
             hb_tool_stop_transfer(g_tool_ev);
@@ -503,7 +532,8 @@ int main(int argc, char *argv[])
 
         pthread_create(&g_ch[i].feed_tid,   NULL, feed_thread,   &g_ch[i]);
         pthread_create(&g_ch[i].output_tid, NULL, output_thread, &g_ch[i]);
-        printf("  Pipe %d: encoder + threads started\n", i);
+        pthread_create(&g_ch[i].pym_tid,    NULL, pym_thread,    &g_ch[i]);
+        printf("  Pipe %d: encoder + pym + threads started\n", i);
     }
 
     printf("\n"
@@ -560,6 +590,8 @@ int main(int argc, char *argv[])
             pthread_join(g_ch[i].feed_tid, NULL);
         if (g_ch[i].output_tid)
             pthread_join(g_ch[i].output_tid, NULL);
+        if (g_ch[i].pym_tid)
+            pthread_join(g_ch[i].pym_tid, NULL);
 
         release_encoder(&g_ch[i]);
         printf("    frames=%lu errors=%lu\n",

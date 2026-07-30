@@ -43,4 +43,4 @@ echo "  Cam cfg: $CAM_CFG"
 echo "=========================================="
 echo ""
 
-exec "$BIN" -v "$VIO_CFG" -c "$CAM_CFG"
+"$BIN" -v "$VIO_CFG" -c "$CAM_CFG"
