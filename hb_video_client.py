@@ -6,8 +6,8 @@ hb_video_client.py - J6B 视频流客户端 (网络通信层)
   1. 通过 TCP 连接远端 J6B 设备 (默认端口 10086)
   2. 发送 NET_SEND_CFG 配置包启用视频流传输
   3. 接收并解析 cmd_header_new_t + 数据帧, 自动识别:
-     - NV12 (YUV_DATA)    → _nv12_to_bgr()  纯 numpy 转换
-     - H.264 (VIDEO_DATA) → PyAV 硬件解码 → BGR
+     - NV12 (NV12_DATA)   → _nv12_to_bgr()  纯 numpy 转换
+     - H.264 (H264_DATA)  → PyAV 软件解码 → BGR
   4. 将解码后的 BGR 图像通过回调通知上层
 
 协议说明:
@@ -18,7 +18,7 @@ hb_video_client.py - J6B 视频流客户端 (网络通信层)
     - header_check1 : 0x6789ABCD  (魔数)
     - header_end    : 0xFFEEDDCC  (魔数)
     - len           : 数据体长度
-    - type          : 1=YUV_DATA(NV12), 3=VIDEO_DATA(H.264)
+    - type          : 1=NV12_DATA, 3=H264_DATA
     - format        : 0=YUVNV12
     - width/height/stride : 图像尺寸信息
     - frame_id      : 帧序号
@@ -69,8 +69,8 @@ class HBVideoClient:
     J6B 视频流客户端.
 
     自动识别数据类型并解码:
-      - NV12 (YUV_DATA, type=1)   → 纯 numpy BT.601 转换
-      - H.264 (VIDEO_DATA, type=3) → PyAV 软件解码
+      - NV12 (type=1) → 纯 numpy BT.601 转换
+      - H.264 (type=3) → PyAV 软件解码
     两种模式统一输出 BGR 图像, 对上层 GUI/CLI 透明。
     """
 
@@ -103,13 +103,17 @@ class HBVideoClient:
         self._frame_callbacks: list = []
         self._callbacks_lock = threading.Lock()
 
+        # 状态回调 (FPS 等遥测数据, 格式与 _notify_status 参数相同)
+        self._status_callbacks: list = []
+        self._status_lock = threading.Lock()
+
         # 统计信息
         self.frame_count = 0
         self.error_count = 0
         self.total_bytes = 0   # 累计接收字节数 (含所有帧, 用于带宽计算)
         self._lock = threading.Lock()
 
-        # H.264 解码器 (按 pipe_id 独立, 仅 VIDEO_DATA 时使用)
+        # H.264 解码器 (按 pipe_id 独立, 仅 H264_DATA 时使用)
         self._h264_decoders: dict[int, 'av.CodecContext'] = {}
 
         # 每路独立解码线程 (并行解码, 突破单线程串行瓶颈)
@@ -198,6 +202,17 @@ class HBVideoClient:
             if callback in self._frame_callbacks:
                 self._frame_callbacks.remove(callback)
 
+    def register_status_callback(self, callback):
+        """注册状态回调函数 — 接收 FPS 等遥测数据 (线程安全)."""
+        with self._status_lock:
+            self._status_callbacks.append(callback)
+
+    def remove_status_callback(self, callback):
+        """移除状态回调 (线程安全)."""
+        with self._status_lock:
+            if callback in self._status_callbacks:
+                self._status_callbacks.remove(callback)
+
     def _notify_frame(self, frame_info: dict, bgr_image: np.ndarray):
         """通知所有注册的回调 (会被多个解码线程并发调用)."""
         with self._callbacks_lock:
@@ -207,6 +222,20 @@ class HBVideoClient:
                 cb(frame_info, bgr_image)
             except Exception as e:
                 logger.error(f"帧回调异常: {e}")
+
+    # FPS 数据格式: 5 字节 uint8_t (port0=5, port7=6, port8=7, port9=8, port10=9)
+    # plugin_id=0x465053 ("FPS") 标识数据来源
+    FPS_FORMAT = "<5B"
+
+    def _notify_status(self, status: dict):
+        """通知所有状态回调 (在接收线程中同步调用)."""
+        with self._status_lock:
+            callbacks = list(self._status_callbacks)
+        for cb in callbacks:
+            try:
+                cb(status)
+            except Exception as e:
+                logger.error(f"状态回调异常: {e}")
 
     # ------------------------------------------------------------------
     # 数据接收
@@ -256,9 +285,22 @@ class HBVideoClient:
         data_len = header_fields[IDX_LEN]
         data_type = header_fields[IDX_TYPE]
 
-        # 4. 跳过非视频数据
-        if data_type not in (DataType.YUV_DATA, DataType.RAW_DATA,
-                              DataType.VIDEO_DATA):
+        # 4. 处理 FPS 状态消息 (同 TCP 连接, 每秒1条, 5字节)
+        if data_type == DataType.MESSAGE_CTL_DEFINE_BY_USE:
+            if data_len >= 5:
+                body = self._recv_exact(data_len)
+                if body is not None and len(body) >= 5:
+                    fps_data = struct.unpack(self.FPS_FORMAT, body[:5])
+                    self._notify_status({
+                        'fvc': fps_data[0], 'avm1': fps_data[1],
+                        'avm2': fps_data[2], 'avm3': fps_data[3],
+                        'avm4': fps_data[4],
+                    })
+            return None
+
+        # 5. 跳过其他非视频数据
+        if data_type not in (DataType.NV12_DATA, DataType.RAW_DATA,
+                              DataType.H264_DATA):
             if data_len > 0:
                 self._recv_exact(data_len)
             return None
@@ -280,7 +322,7 @@ class HBVideoClient:
     def _decode_one_frame(self, body_data: bytes, frame_info: dict,
                           pipe_id: int, data_type: int) -> np.ndarray | None:
         """解码单帧数据 → BGR (在解码线程中调用)."""
-        if data_type == DataType.VIDEO_DATA:
+        if data_type == DataType.H264_DATA:
             return self._decode_h264(body_data, pipe_id, frame_info)
         else:
             try:

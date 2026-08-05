@@ -169,10 +169,26 @@ class HBVideoGUI:
         self.no_signal_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
     def _build_info_panel(self, parent):
-        """构建信息面板."""
-        panel = ttk.LabelFrame(parent, text="通道信息", padding=6, width=280)
-        panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 0))
-        panel.pack_propagate(False)
+        """构建信息面板 (右侧: J6B摄像头帧率 + PC端通道信息)."""
+        # 右侧容器
+        right_container = ttk.Frame(parent, width=280)
+        right_container.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 0))
+        right_container.pack_propagate(False)
+
+        # ---- J6B端摄像头帧率 ----
+        cam_fps_panel = ttk.LabelFrame(right_container, text="J6B端摄像头帧率", padding=4)
+        cam_fps_panel.pack(fill=tk.X, pady=(0, 4))
+
+        self.cam_fps_text = tk.Text(
+            cam_fps_panel, wrap=tk.WORD, state=tk.DISABLED,
+            font=("Consolas", 10), bg="#f0f0f0", relief=tk.FLAT,
+            height=5
+        )
+        self.cam_fps_text.pack(fill=tk.X)
+
+        # ---- PC端通道信息 ----
+        panel = ttk.LabelFrame(right_container, text="PC端通道信息", padding=6)
+        panel.pack(fill=tk.BOTH, expand=True)
 
         # 各通道概况
         overview_frame = ttk.LabelFrame(panel, text="各通道概况", padding=4)
@@ -329,6 +345,7 @@ class HBVideoGUI:
         def do_connect():
             client = HBVideoClient(host=host, port=port, enable_yuv=True)
             client.register_frame_callback(self._on_frame_received)
+            client.register_status_callback(self._on_status_received)
             if client.start():
                 self.client = client
                 self.root.after(0, self._on_connected, host, port)
@@ -365,6 +382,7 @@ class HBVideoGUI:
         self.snapshot_btn.config(state=tk.DISABLED)
         self.status_var.set("已断开")
         self._log("已断开连接")
+        self._update_cam_fps_panel("等待连接...")
         self.fps_label.config(text="FPS: --")
         self.bw_label.config(text="带宽: --")
         self._bw_last_bytes = 0
@@ -446,6 +464,27 @@ class HBVideoGUI:
                 self._pipe_fps[pid] = count / elapsed
             self._pipe_fps_count.clear()
             self._fps_start_time = now
+
+    def _on_status_received(self, status: dict):
+        """
+        接收到设备遥测状态 (在接收线程中调用, 通过 root.after 投递到主线程).
+        """
+        fvc = status.get('fvc', 0)
+        avm1 = status.get('avm1', 0)
+        avm2 = status.get('avm2', 0)
+        avm3 = status.get('avm3', 0)
+        avm4 = status.get('avm4', 0)
+
+        # 更新右侧面板
+        fps_lines = f"FVC : {fvc}\nAVM1: {avm1}\nAVM2: {avm2}\nAVM3: {avm3}\nAVM4: {avm4}"
+        self.root.after(0, lambda: self._update_cam_fps_panel(fps_lines))
+
+    def _update_cam_fps_panel(self, text: str):
+        """更新 J6B 端摄像头帧率面板 (主线程)."""
+        self.cam_fps_text.config(state=tk.NORMAL)
+        self.cam_fps_text.delete("1.0", tk.END)
+        self.cam_fps_text.insert("1.0", text)
+        self.cam_fps_text.config(state=tk.DISABLED)
 
     # ------------------------------------------------------------------
     # 画面刷新 (主线程定时器)
@@ -583,11 +622,9 @@ class HBVideoGUI:
             f"通道:     Pipe {pipe_id}",
             f"FPS:      {fps:.1f}",
             f"帧类型:   {frame_info.get('type_name', '?')}",
-            f"图像格式: {frame_info.get('format', '?')}",
             f"分辨率:   {frame_info['width']} × {frame_info['height']}",
             f"行步长:   {frame_info['stride']}",
             f"帧序号:   #{frame_info['frame_id']}",
-            f"CHN ID:   {frame_info['chn_id']}",
             f"数据长度: {frame_info['data_len']:,} bytes",
             f"芯片版本: {chip_name}",
         ]

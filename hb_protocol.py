@@ -73,11 +73,11 @@ class VideoType(IntEnum):
 
 
 class DataType(IntEnum):
-    """数据类型枚举"""
+    """数据类型枚举 (显示名称已优化, 括号内为原始协议名称)"""
     RAW_DATA               = 0
-    YUV_DATA               = 1
+    NV12_DATA              = 1   # 原始协议: YUV_DATA
     JPEG_DATA              = 2
-    VIDEO_DATA             = 3
+    H264_DATA              = 3   # 原始协议: VIDEO_DATA
     VIDEO_CFG              = 4
     STATS_AWB_DATA         = 5
     STATS_AEfull_DATA      = 6
@@ -251,7 +251,7 @@ def make_yuv_frame_header(width: int, height: int, stride: int,
     fields[IDX_HEADER_END]    = TOOL_HEADER_END_N
     fields[IDX_HEADER_CRC]    = 0
     fields[IDX_LEN]           = y_size + uv_size
-    fields[IDX_TYPE]          = DataType.YUV_DATA
+    fields[IDX_TYPE]          = DataType.NV12_DATA
     fields[IDX_FORMAT]        = YuvType.YUVNV12
     fields[IDX_WIDTH]         = width
     fields[IDX_HEIGHT]        = height

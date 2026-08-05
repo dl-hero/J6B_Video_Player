@@ -89,6 +89,13 @@ static enc_channel_t  g_ch[CHANNEL_NUM];
 static tool_event_t  *g_tool_ev = NULL;   /* hb_tool_server 事件句柄 */
 static volatile int   g_quit = 0;
 static int            g_no_init = 0;       /* 跳过 VIO/Cam 初始化 (复用已运行的VIO) */
+static pthread_t      g_fps_tid;           /* FPS 发送线程 */
+
+/* FPS 数据结构 — 通过 MESSAGE_CTL_DEFINE_BY_USE 发送, 协议字段 plugin_id=0x465053 ("FPS") */
+#define FPS_PORT_COUNT  5
+typedef struct __attribute__((packed)) {
+    uint8_t fps[FPS_PORT_COUNT];  /* port0, port7, port8, port9, port10 */
+} fps_info_t;
 
 /* 默认 JSON 配置文件路径 (可通过命令行参数覆盖) */
 static const char *g_vio_cfg = "./vpm_config.json";
@@ -287,6 +294,59 @@ static void *pym_thread(void *arg)
     }
 
     printf("Pipe %d: pym thread exit\n", ch->pipe_id);
+    return NULL;
+}
+
+/* ======================================================================
+ * FPS 发送线程
+ * 每秒读 sysfs /sys/class/misc/port_X/status/fps → 打包 → TCP 推送
+ * 通过 hb_tool_used_define_pic 走 send_data_to_pc_full_bd,
+ * PC 未连接时 tcp_open==0 自动丢弃, 不会阻塞。
+ * ====================================================================== */
+static int camera_port_fps(int port)
+{
+    char buffer[128];
+    char sysnode[128];
+    int fps = 0;
+
+    snprintf(sysnode, sizeof(sysnode),
+             "/sys/class/misc/port_%d/status/fps", port);
+    FILE *fp = fopen(sysnode, "r");
+    if (fp == NULL) return 0;
+    if (fgets(buffer, sizeof(buffer), fp) != NULL) {
+        char *ptr = strstr(buffer, "fps");
+        if (ptr != NULL && ptr > buffer + 1) {
+            fps = (int)strtoul(ptr - 2, NULL, 10);
+            if (fps > 50) fps = 0;
+        }
+    }
+    fclose(fp);
+    return fps;
+}
+
+static void *fps_thread(void *arg)
+{
+    (void)arg;
+    fps_info_t  fps_data;
+    cmd_header_new_t header;
+    static const int fps_ports[FPS_PORT_COUNT] = {0, 7, 8, 9, 10};
+
+    while (!g_quit) {
+        sleep(1);
+
+        for (int i = 0; i < FPS_PORT_COUNT; i++)
+            fps_data.fps[i] = (uint8_t)camera_port_fps(fps_ports[i]);
+
+        memset(&header, 0, sizeof(header));
+        header.type      = MESSAGE_CTL_DEFINE_BY_USE;
+        header.len       = sizeof(fps_data);
+        header.plugin_id = 0x465053;  /* "FPS" in ASCII */
+
+        hb_tool_used_define_pic(g_tool_ev, &header,
+                                &fps_data, sizeof(fps_data));
+    }
+
+    printf("FPS thread exit\n");
     return NULL;
 }
 
@@ -536,6 +596,10 @@ int main(int argc, char *argv[])
         printf("  Pipe %d: encoder + pym + threads started\n", i);
     }
 
+    /* 启动 FPS 发送线程 (每路编码器之后, 共用 g_tool_ev) */
+    pthread_create(&g_fps_tid, NULL, fps_thread, NULL);
+    printf("  FPS sender thread started\n");
+
     printf("\n"
            "  >>> Streaming 4-channel H.264 via TCP port %d <<<\n"
            "  Press Ctrl+C to stop.\n\n", DEFAULT_PORT);
@@ -598,6 +662,11 @@ int main(int argc, char *argv[])
                (unsigned long)g_ch[i].frame_count,
                (unsigned long)g_ch[i].error_count);
     }
+
+    /* 停止 FPS 发送线程 (必须在 hb_tool_stop_transfer 之前) */
+    g_quit = 1;
+    if (g_fps_tid)
+        pthread_join(g_fps_tid, NULL);
 
     if (g_tool_ev) {
         hb_tool_stop_transfer(g_tool_ev);
