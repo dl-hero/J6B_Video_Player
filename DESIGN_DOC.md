@@ -1,7 +1,7 @@
 # J6B Video Player — 架构设计文档与使用说明
 
-> **版本**: 1.6.0  
-> **日期**: 2026-07-28  
+> **版本**: 1.7.0  
+> **日期**: 2026-08-05  
 > **适用平台**: Windows 10+ / Ubuntu 22.04+  
 > **目标设备**: J6B (Horizon Robotics J6 芯片平台)  
 > **已验证设备**: J6B_GAC_AY5-TM (IP: 192.168.0.140, 4 路 SC361AT 摄像头)  
@@ -39,6 +39,11 @@
 | | | **`hb_video_client.py`** | **低延迟解码修复**: `decoder.parse()` → `av.Packet(data)` 直送解码器, 消除 PyAV parse 内部缓冲累积(实验验证延迟从几秒降到~200ms)。`thread_count=1` 单线程解码。 |
 | | | **`hb_protocol.py`** | 新增 `CHIP_NAMES = {0:'XJ3',1:'J5',2:'J6B'}` 显示映射字典。 |
 | | | `DESIGN_DOC.md` | 新增第 14 节「问题排查实录」。更新 13.5-13.8 节编译部署参数。 |
+| **1.7.0** | **2026-08-05** | **`venc_stream.c`** | **新增 PYM 消费线程 + FPS 推送线程**: 每路 pipe 独立 `pym_thread` (`hb_vio_get_data(PYM_V3)`→`hb_vio_free_pymbuf`) 驱动 ISP AE/AWB/AF 统计通路, 恢复 R-Core 帧率/3A 统计; `fps_thread` 每秒读 sysfs `/sys/class/misc/port_X/status/fps` → `hb_tool_used_define_pic(type=16)` 推送 5 字节 FPS 到 PC。修复 `run.sh` 中 `exec` 阻断 init.sh 后续启动的问题。 |
+| | | **`hb_video_client.py`** | **新增状态回调框架**: `register_status_callback`/`_notify_status` 支持遥测数据通知; `_recv_loop` 识别 `MESSAGE_CTL_DEFINE_BY_USE(16)` 解析 5 字节 FPS 数据 (`struct.unpack("<5B")`)。 |
+| | | **`hb_video_gui.py`** | **新增「J6B端摄像头帧率」面板**: 右侧独立面板显示 FVC/AVM1-4 实时帧率 (5 行); 顶部控制栏移除摄像头标签。**详情面板优化**: `YUV_DATA`→`NV12_DATA`, `VIDEO_DATA`→`H264_DATA`; 删除无用的「图像格式」「CHN ID」「芯片版本」字段。右侧面板标题「通道信息」→「PC端通道信息」。 |
+| | | **`hb_protocol.py`** | `DataType` 枚举显示名优化: `YUV_DATA(1)`→`NV12_DATA`, `VIDEO_DATA(3)`→`H264_DATA`。 |
+| | | **`run.sh`** | 修复 `then/` 语法错误; 移除 `exec` 避免替换当前 shell 阻断 init.sh 后续启动。 |
 | **1.6.0** | **2026-07-28** | **`hb_video_client.py`** | **重大重构**: 并行解码架构 + H.264 解码路径修复 + 带宽统计修正。**解码路径**: `av.Packet(data)` 直送 → `decoder.parse(data)` 逐个 NAL 单元解码 (修复 AVERROR_INVALIDDATA)。**线程模型**: 接收线程仅负责 socket read→分发, 每路独立解码线程 (`_pipe_decode_loop`) 通过 `queue.Queue(maxsize=2)` 并行处理。**解码器**: `thread_count` 1→0 (FFmpeg auto 多线程), `flags|=4` (OUTPUT_CORRUPT)。**带宽统计**: 从回调点移至 `_read_one_frame()` 数据读取点, 统计所有帧的实际接收字节。**移除**: 排空机制 (导致显示帧率从 25fps 降至 2fps)。**线程安全**: 回调列表加 `_callbacks_lock`。**稳定性验证**: 5 分钟/10 小时压力测试, 解码速率恒定 100fps, 零错误, 无延迟累积。 |
 | | | **`hb_video_gui.py`** | 带宽统计改用 `client.get_stats()['total_bytes']` (实际接收字节数)。 |
 | | | **`CLAUDE.md`** | 更新延迟优化说明、架构描述、H.264 解码路径、线程安全说明。 |
@@ -93,7 +98,7 @@ J6B 平台是地平线（Horizon Robotics）推出的智能驾驶芯片平台。
 | 截图保存 | GUI 和 CLI 均支持 JPG 格式截图，自动标注 pipe 编号 |
 | 帧信息面板 | 实时显示帧类型、分辨率、帧序号、PIPE/CHN ID、数据长度等元数据 |
 | FPS 统计 | 各路独立 1 秒滑动窗口帧率统计，GUI 顶部显示总 FPS |
-| 连接状态管理 | 异步连接/断开，GUI 状态栏和日志面板双重反馈 |
+| 状态管理 | 异步连接/断开，GUI 状态栏和日志面板双重反馈，设备摄像头帧率实时推送 |
 | 跨平台支持 | Windows 10+ 和 Ubuntu 22.04+ 均可运行，字体自动适配 (DejaVu Sans / Consolas) |
 
 ### 1.3 依赖
@@ -698,6 +703,78 @@ while self._running:
 ```
 同 GUI 模式的线程模型 (接收线程 + 每路独立解码线程)。
 帧回调在解码线程中调用, 执行 cv2.imwrite / cv2.imshow 等操作。
+```
+
+### 5.2.1 J6B 设备端线程 (venc_stream v1.7.0)
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                venc_stream 设备端线程模型                      │
+│                                                               │
+│   Main Thread (主线程, sleep(5) 统计循环)                      │
+│      │                                                        │
+│      │ Phase 1-3 初始化完成                                    │
+│      ▼                                                        │
+│   ┌──────────┬──────────┬──────────┬──────────┐              │
+│   │ Pipe 7   │ Pipe 8   │ Pipe 9   │ Pipe 10  │              │
+│   │          │          │          │          │              │
+│   │ feed_tid │ feed_tid │ feed_tid │ feed_tid │ 取帧线程     │
+│   │   ↓      │   ↓      │   ↓      │   ↓      │              │
+│   │ CIM→VPU  │ CIM→VPU  │ CIM→VPU  │ CIM→VPU  │ 编码输入     │
+│   │          │          │          │          │              │
+│   │ output_tid│output_tid│output_tid│output_tid│ 输出线程    │
+│   │   ↓      │   ↓      │   ↓      │   ↓      │              │
+│   │ VPU→TCP  │ VPU→TCP  │ VPU→TCP  │ VPU→TCP  │ H.264 发送   │
+│   │          │          │          │          │              │
+│   │ pym_tid  │ pym_tid  │ pym_tid  │ pym_tid  │ PYM 消费    │
+│   │   ↓      │   ↓      │   ↓      │   ↓      │ (v1.7.0 新增)│
+│   │ PYM→free │ PYM→free │ PYM→free │ PYM→free │ 驱动 ISP 统计│
+│   └──────────┴──────────┴──────────┴──────────┘              │
+│                                                               │
+│   ┌──────────────────────────────────────────┐               │
+│   │ fps_tid (FPS 推送线程, v1.7.0 新增)       │               │
+│   │ - sleep(1) 每秒循环                       │               │
+│   │ - camera_port_fps(0,7,8,9,10) 读 sysfs   │               │
+│   │ - 打包 fps_info_t (5 bytes)              │               │
+│   │ - hb_tool_used_define_pic(type=16)       │               │
+│   │   共用 g_tool_ev, PC 未连接时自动丢弃      │               │
+│   └──────────────────────────────────────────┘               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 5.2.2 FPS 遥测数据流 (v1.7.0 新增)
+
+```
+J6B 设备:
+  /sys/class/misc/port_X/status/fps  ← camsys 驱动 (MIPI 中断计数)
+       │
+       ▼
+  fps_thread: camera_port_fps() 解析 "fps" 前的两位数
+       │
+       ▼
+  fps_info_t {uint8_t[5]} → hb_tool_used_define_pic(
+      type=MESSAGE_CTL_DEFINE_BY_USE(16),
+      plugin_id=0x465053("FPS"),
+      len=5
+  )
+       │
+       ▼  send_data_to_pc_full_bd (tcp_open==0 时自动丢弃)
+  ──── TCP port 10086 ────→
+       │
+PC 端:
+       ▼
+  _recv_loop: _read_one_frame()
+       │ type==16 && data_len>=5
+       ▼
+  struct.unpack("<5B", body[:5]) → fps_data
+       │
+       ▼
+  _notify_status({fvc, avm1, avm2, avm3, avm4})
+       │
+       ├─→ GUI _on_status_received() → root.after(0, ...)
+       │     └─→ _update_cam_fps_panel() 更新右侧「J6B端摄像头帧率」面板
+       │
+       └─→ CLI (如注册) → print/stderr 输出
 ```
 
 ### 5.3 帧数据流 (完整管道, v1.6.0)

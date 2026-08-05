@@ -10,7 +10,7 @@ PC 端通过 TCP 连接 J6B (地平线) 设备接收实时视频流并显示的�
 - **NV12 原始像素流** (camera_sample) — 纯 numpy BT.601 转换，无需额外依赖
 - **H.264 压缩码流** (venc_stream) — PyAV 软件解码，带宽占用降低 95%+
 
-J6B 设备端 `tools/viotool/venc_stream/` — CIM4 四路视频流 VPU 硬件 H.264 编码 + TCP 输出 (已调通, SC361AT ×4, 1696×1168, 4Mbps/路)。
+J6B 设备端 `tools/viotool/venc_stream/` — CIM4 四路视频流 VPU 硬件 H.264 编码 + TCP 输出 (已调通, SC361AT ×4, 1696×1168, 4Mbps/路)。新增 PYM 消费线程 (驱动 ISP AE/AWB/AF 统计通路) 和 FPS 推送线程 (每秒读 sysfs → TCP 发送摄像头帧率到 PC)。
 
 **延迟优化 (v1.6.0, 2026-07-28)**:
 - J6B 编码器: `vbv_buffer_size=300ms`, `frame_buf_count=3` (低延迟配置, v1.5.0)
@@ -82,22 +82,25 @@ tools/viotool/
 - **`hb_video_client.py`** — `HBVideoClient` 类。连接流程：TCP connect → 发送 NET_SEND_CFG (104 字节) → 启动 daemon 接收线程 `_recv_loop()` + 每路独立解码线程 `_pipe_decode_loop()`。架构:
   - **接收线程** (`_recv_loop`): 读取 80B 帧头 → 魔数验证 → 读取数据体 → 按 `pipe_id` 分发到对应解码队列 (`queue.Queue(maxsize=2)`)
   - **解码线程 ×N** (`_pipe_decode_loop`): 惰性创建，每路独立线程，从队列取原始帧 → 根据 `data_type` 自动选择解码器:
-    - `YUV_DATA (1)` → `_nv12_to_bgr()` 纯 numpy ITU-R BT.601 转换 (无需 PyAV)
-    - `VIDEO_DATA (3)` → `_decode_h264()`: `decoder.parse(data)` → 逐个 NAL 单元 `decoder.decode(packet)` → `to_ndarray(bgr24)` (PyAV 解码)
+    - `NV12_DATA (1)` → `_nv12_to_bgr()` 纯 numpy ITU-R BT.601 转换 (无需 PyAV)
+    - `H264_DATA (3)` → `_decode_h264()`: `decoder.parse(data)` → 逐个 NAL 单元 `decoder.decode(packet)` → `to_ndarray(bgr24)` (PyAV 解码)
+  - **状态消息**: `MESSAGE_CTL_DEFINE_BY_USE (16)` → 解析 FPS 数据 → `_notify_status()` 回调通知 GUI
   - 帧同步 `_sync_to_header()` 在魔数不匹配时逐字节滑动搜索 `0xCCDDEEFF`
   - 解码器配置: `thread_count=0` (FFmpeg auto 多线程), `flags|=4` (AV_CODEC_FLAG_OUTPUT_CORRUPT)
   - 带宽统计: `total_bytes` 在 `_read_one_frame()` 中累计所有接收字节 (含被解码线程排队的帧), 通过 `get_stats()` 暴露
 
-- **`hb_video_gui.py`** — `HBVideoGUI` 类。连接在后台线程执行，帧回调 `_on_frame_received` 按 `pipe_id` 分路存入 `_pipe_frames` 字典，主线程 `_update_display()` 每 30ms 定时刷新(零拷贝引用传递)。田字格多路同时显示，各路独立渲染单元。BGR→RGB→PIL Image→ImageTk 渲染管线。顶部控制栏显示实时带宽(Mbps)和总FPS。配置文件 `.j6b_player_config.json` 持久化 IP/端口/截图目录。
+- **`hb_video_gui.py`** — `HBVideoGUI` 类。连接在后台线程执行，帧回调 `_on_frame_received` 按 `pipe_id` 分路存入 `_pipe_frames` 字典，主线程 `_update_display()` 每 30ms 定时刷新(零拷贝引用传递)。田字格多路同时显示，各路独立渲染单元。BGR→RGB→PIL Image→ImageTk 渲染管线。顶部控制栏显示实时带宽(Mbps)和总FPS。右侧面板含「J6B端摄像头帧率」(从设备 FPS 推送实时更新)和「PC端通道信息」(各通道概况 + 当前帧详情 + 日志)。配置文件 `.j6b_player_config.json` 持久化 IP/端口/截图目录。
 
 - **`hb_video_cli.py`** — `CLIVideoClient` 类。支持 `--pipe` 单通道窗口或 2×3 网格多路显示。无头模式 `--no-display` 仅保存帧。
 
-- **`tools/viotool/venc_stream/`** — J6B 设备端工具 (v1.5.0 已调通)。`venc_stream.c` (~540行) 复用 `camera_sample` 的 VIO JSON 配置 + MediaCodec API 实现 4 路并发 H.264 硬件编码 (SC361AT, 1696×1168, 30fps, 4Mbps/路), 通过 `hb_tool_send_video_pic()` 走 libhbplayer TCP 发送。低延迟配置: `vbv_buffer_size=300ms` + `frame_buf_count=3`。配置文件: `case_matrix/GAC_BYPASS_TEST_4V_SC361ATSTD_1696x1168_RSEMI_RX4`。
+- **`tools/viotool/venc_stream/`** — J6B 设备端工具 (v1.7.0)。`venc_stream.c` (~650行) 复用 `camera_sample` 的 VIO JSON 配置 + MediaCodec API 实现 4 路并发 H.264 硬件编码 (SC361AT, 1696×1168, 30fps, 4Mbps/路), 通过 `hb_tool_send_video_pic()` 走 libhbplayer TCP 发送。**v1.7.0 新增**: PYM 消费线程 (每路独立 `pym_thread`, `hb_vio_get_data(PYM_V3)` → `hb_vio_free_pymbuf`, 驱动 ISP AE/AWB/AF 统计通路); FPS 推送线程 (`fps_thread`, 每秒读 `/sys/class/misc/port_X/status/fps` → `hb_tool_used_define_pic(type=16)` 推送 5 字节 FPS 到 PC)。低延迟配置: `vbv_buffer_size=300ms` + `frame_buf_count=3`。配置文件: `case_matrix/GAC_BYPASS_TEST_4V_SC361ATSTD_1696x1168_RSEMI_RX4`。
 
 ## 关键设计要点
 
-- **多路视频**：5 路视频通过同一 TCP 连接交错传输，帧头 `pipe_id` 字段 (偏移 56) 区分通道。设备端 `send_data_load_balance` 在 5 通道间动态调度。
-- **双解码模式**：帧头 `type=1` (YUV_DATA) 走 `_nv12_to_bgr()` numpy 转换；`type=3` (VIDEO_DATA) 走 `_decode_h264()` PyAV 解码。两种模式对上层透明，GUI/CLI 无需改动。
+- **多路视频**：最多 5 路视频通过同一 TCP 连接交错传输，帧头 `pipe_id` 字段 (偏移 56) 区分通道。设备端 `send_data_load_balance` 在 5 通道间动态调度。
+- **PYM 消费线程**：每路 pipe 独立线程调用 `hb_vio_get_data(PYM_V3)` → `hb_vio_free_pymbuf`，持续消费 PYM buffer 以驱动 ISP 驱动完成 PYM DMA 配置和 R-Core 共享内存通路，保障 AE/AWB/AF 统计正常。不处理数据本身，零 CPU/内存开销。
+- **FPS 推送**：设备端 FPS 线程每秒读 sysfs `/sys/class/misc/port_X/status/fps` → 打包为 5 字节 `fps_info_t` → `hb_tool_used_define_pic(type=16, plugin_id="FPS")` 推送至 PC。PC 未连接时 `tcp_open==0` 自动丢弃，不阻塞。PC 端 `_recv_loop` 识别 `type==16` → `_notify_status()` → GUI 更新「J6B端摄像头帧率」面板。
+- **双解码模式**：帧头 `type=1` (NV12_DATA) 走 `_nv12_to_bgr()` numpy 转换；`type=3` (H264_DATA) 走 `_decode_h264()` PyAV 解码。两种模式对上层透明，GUI/CLI 无需改动。
 - **NV12 布局**：`stride × height` Y 平面 + `stride × height / 2` 交错 UV 平面。当 `stride > width` 时需裁剪到有效宽度。
 - **H.264 码流**：`code_type` 字段 (偏移 48) 标识编码类型 (H264=0, H265=1)。PC 端用 `decoder.parse(data)` 将 Annex B 字节流拆分为 NAL 单元对齐的 Packet, 再逐个 `decoder.decode(packet)`。**不能使用 `av.Packet(data)` 直送** — 解码器在无 SPS/PPS 上下文时会拒绝所有帧 (AVERROR_INVALIDDATA), 导致永久无法初始化解码器。解码器按 `pipe_id` 独立管理, `thread_count=0` (auto 多线程)。
 - **连接限制**：设备端每次启动仅接受一次 TCP 连接，断开后需重启设备 (`ssh root@<IP> "reboot"`)。
