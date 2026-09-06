@@ -530,9 +530,9 @@ int main(int argc, char *argv[])
     signal(SIGTERM, sig_handler);
 
     printf("============================================================\n");
-    printf("  J6B VENC Stream — 4-Channel H.264 Encoder + TCP Output\n");
+    printf("  J6B VENC Stream — 1~6-Channel H.264 Encoder + TCP Output\n");
     printf("============================================================\n");
-    printf("  Input Resolution : 4k(3940×2160)×1 + 960P(1280×960)×%d\n", CHANNEL_NUM - 1);
+    printf("  Input Resolution : 4K(3840×2160)×1 + 960P(1280×960)×%d\n", CHANNEL_NUM - 1);
     printf("  Output Resolution : 1080p(1920×1080)×1 + 960P(1280×960)×%d\n", CHANNEL_NUM - 1);
     printf("  Frame rate : %d fps\n", ENC_FPS);
     printf("  Codec      : H.264 CBR %d kbps × %d ch\n",
