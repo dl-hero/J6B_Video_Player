@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# SDK path: tools/viotool/venc_stream
+
 cd src/
 make clean && make && cp venc_stream ../bin/
 cd ..

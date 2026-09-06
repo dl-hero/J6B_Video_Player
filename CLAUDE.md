@@ -98,7 +98,7 @@ tools/viotool/
 ## 关键设计要点
 
 - **多路视频**：最多 5 路视频通过同一 TCP 连接交错传输，帧头 `pipe_id` 字段 (偏移 56) 区分通道。设备端 `send_data_load_balance` 在 5 通道间动态调度。
-- **PYM 消费线程**：每路 pipe 独立线程调用 `hb_vio_get_data(PYM_V3)` → `hb_vio_free_pymbuf`，持续消费 PYM buffer 以驱动 ISP 驱动完成 PYM DMA 配置和 R-Core 共享内存通路，保障 AE/AWB/AF 统计正常。不处理数据本身，零 CPU/内存开销。
+- **PYM 消费线程**：每路 pipe 独立线程调用 `hb_vio_get_data(PYM_V3)` → `hb_vio_free_pymbuf`，持续消费 PYM buffer 以驱动 ISP 固件完成 PYM DMA 配置和 sbuf 共享内存通路，保障 A 核内 ISP 固件(KF) → libisp_algo(UF) 的 2A(AE/AWB) 统计上报（含帧率 frame_id/timestamp）正常。不处理数据本身，零 CPU/内存开销。注：2A/帧率全程在 A 核内部经 `/dev/isp_hwX_sbufX` 传递，不经过 R-Core。
 - **FPS 推送**：设备端 FPS 线程每秒读 sysfs `/sys/class/misc/port_X/status/fps` → 打包为 5 字节 `fps_info_t` → `hb_tool_used_define_pic(type=16, plugin_id="FPS")` 推送至 PC。PC 未连接时 `tcp_open==0` 自动丢弃，不阻塞。PC 端 `_recv_loop` 识别 `type==16` → `_notify_status()` → GUI 更新「J6B端摄像头帧率」面板。
 - **双解码模式**：帧头 `type=1` (NV12_DATA) 走 `_nv12_to_bgr()` numpy 转换；`type=3` (H264_DATA) 走 `_decode_h264()` PyAV 解码。两种模式对上层透明，GUI/CLI 无需改动。
 - **NV12 布局**：`stride × height` Y 平面 + `stride × height / 2` 交错 UV 平面。当 `stride > width` 时需裁剪到有效宽度。

@@ -34,27 +34,33 @@
 /* ======================================================================
  * 可配置参数 (按实际场景修改)
  * ====================================================================== */
-#define CHANNEL_NUM      4           /* 编码通道数 */
-#define ENC_WIDTH        1696        /* 图像宽度 */
-#define ENC_HEIGHT       1168        /* 图像高度 */
+#define CHANNEL_NUM      6           /* 编码通道数: 1 路前视 4K + 5 路 960P */
 #define ENC_FPS          30          /* 帧率 */
 #define ENC_BITRATE      4000            /* 单路码率 4000 kbps = 4 Mbps CBR */
 #define ENC_PIX_FMT      MC_PIXEL_FORMAT_NV12  /* H264 编码器仅支持 4:2:0 (NV12/420P/NV21) */
 #define ENC_GOP_SIZE     ENC_FPS              /* I 帧间隔 1 秒 */
 
 /* 调试日志: 改为 0 关闭, 1 开启 */
-#define VENC_DEBUG       0
+#define VENC_DEBUG       1
 
 /* Pipeline ID 映射: vpm_config.json pipelineX 编号, 用于 hb_vio_start_pipeline(id) */
-static const int PIPE_IDS[CHANNEL_NUM] = {7, 8, 9, 10};
+static const int PIPE_IDS[CHANNEL_NUM] = {0, 7, 8, 9, 10, 11};
 
 /* CAM Port 映射: hb_j6dev.json port_X 编号, 用于 hb_cam_get_data(port, ...) */
-static const int CAM_PORTS[CHANNEL_NUM] = {7, 8, 9, 10};
+static const int CAM_PORTS[CHANNEL_NUM] = {0, 7, 8, 9, 10, 11};
+
+/* 每通道编码分辨率: 前视(0)=1080p(软件降采样), 其余=960P */
+static const int ENC_WIDTHS[CHANNEL_NUM]  = {1920, 1280, 1280, 1280, 1280, 1280};
+static const int ENC_HEIGHTS[CHANNEL_NUM] = {1080,  960,  960,  960,  960,  960};
+
+/* 数据源类型: 1=ISP NV16(YUV422, 前视), 0=CIM NV12(YUV420, YUV sensor) */
+static const int IS_ISP[CHANNEL_NUM] = {1, 0, 0, 0, 0, 0};
 
 /*
- * 注意: ENC_PIX_FMT 需要与 CIM JSON 配置中的 format: 30 (YUV-8bit) 对应。
- * 如果 CIM 实际输出 YUV422, 可改为 MC_PIXEL_FORMAT_YUV422P。
- * VPU 硬件内部会将 YUV422 降采样为 4:2:0 再编码 (见手册 7.1.1 节)。
+ * 注意: ENC_PIX_FMT 固定为 MC_PIXEL_FORMAT_NV12，因为 H264 编码器只接受 4:2:0。
+ * 前视 ISP 输出的是 NV16(YUV422)，由 feed_thread 软件降采样成 NV12 后再送编码器，
+ * 不能直接把 pix_fmt 改成 YUV422P（H264 编码器不接受）。
+ * YUV422 输入仅 MJPEG/JPEG 编码器支持，H264/H265 编码器不支持。
  */
 
 /* ======================================================================
@@ -63,6 +69,9 @@ static const int CAM_PORTS[CHANNEL_NUM] = {7, 8, 9, 10};
 typedef struct {
     int              pipe_id;       /* pipeline 编号 (用于 hb_vio_start_pipeline) */
     int              cam_port;      /* CAM port 编号 (用于 hb_cam_get_data) */
+    int              width;         /* 编码宽度 (per-channel) */
+    int              height;        /* 编码高度 (per-channel) */
+    int              is_isp;        /* 1=ISP NV16 前视, 0=CIM NV12 YUV sensor */
     volatile int     running;       /* 运行标志 */
     volatile int     stream_end;    /* 码流结束标志 */
 
@@ -115,8 +124,8 @@ static int init_encoder(enc_channel_t *ch)
     ctx->encoder  = 1;  /* TRUE */
 
     params = &ctx->video_enc_params;
-    params->width               = ENC_WIDTH;
-    params->height              = ENC_HEIGHT;
+    params->width               = ch->width;
+    params->height              = ch->height;
     params->pix_fmt             = ENC_PIX_FMT;
     params->frame_buf_count     = 3;  /* 低延迟: 3帧流水线 ≈ 100ms */
     params->bitstream_buf_count = 3;
@@ -233,9 +242,9 @@ static void *output_thread(void *arg)
         pic_info.frame_id  = (uint32_t)out_buf.vstream_buf.pts;
         pic_info.type      = VIDEO_DATA;      /* DateType: 3 */
         pic_info.format    = YUVNV12;         /* YUV_TYEP: 复用此字段 */
-        pic_info.width     = ENC_WIDTH;
-        pic_info.height    = ENC_HEIGHT;
-        pic_info.stride    = ENC_WIDTH;
+        pic_info.width     = ch->width;
+        pic_info.height    = ch->height;
+        pic_info.stride    = ch->width;
         pic_info.code_type = H264;            /* VIDEO_TYPE: 0 */
 
         {
@@ -362,12 +371,15 @@ static void *feed_thread(void *arg)
     int ret;
 
     while (ch->running) {
-        /*
-         * Step 1: 阻塞等待 CIM DDR 输出一帧数据。
-         * HB_CAM_YUV_DATA 对应 CIM 的 ddr_enable=1 主通路 YUV 输出。
+        /* Step 1: 取一帧源数据。
+         *   前视(0): ISP 输出 NV16(YUV422) → hb_vio_get_data(HB_VIO_ISP_YUV_DATA)
+         *   其余   : CIM 输出 NV12(YUV420) → hb_cam_get_data(HB_CAM_YUV_DATA)
          */
         memset(&cam_buf, 0, sizeof(cam_buf));
-        ret = hb_cam_get_data(ch->cam_port, HB_CAM_YUV_DATA, &cam_buf);
+        if (ch->is_isp)
+            ret = hb_vio_get_data(ch->pipe_id, HB_VIO_ISP_YUV_DATA, &cam_buf);
+        else
+            ret = hb_cam_get_data(ch->cam_port, HB_CAM_YUV_DATA, &cam_buf);
         if (ret != 0) {
             if (ch->running) {
                 usleep(1000);  /* 1ms 后重试 */
@@ -382,7 +394,10 @@ static void *feed_thread(void *arg)
         memset(&in_buf, 0, sizeof(in_buf));
         ret = hb_mm_mc_dequeue_input_buffer(&ch->enc_ctx, &in_buf, 3000);
         if (ret != 0) {
-            hb_cam_free_data(ch->cam_port, HB_CAM_YUV_DATA, &cam_buf);
+            if (ch->is_isp)
+                hb_vio_free_ispbuf(ch->pipe_id, &cam_buf);
+            else
+                hb_cam_free_data(ch->cam_port, HB_CAM_YUV_DATA, &cam_buf);
             if (ret != (int32_t)HB_MEDIA_ERR_WAIT_TIMEOUT) {
                 fprintf(stderr, "Pipe %d: dequeue input fail(%d / 0x%08X)\n",
                         ch->pipe_id, ret, (unsigned int)ret);
@@ -391,10 +406,7 @@ static void *feed_thread(void *arg)
             continue;
         }
 
-        /*
-         * Step 3: CIM NV12 → Encoder NV12 (逐行拷贝，处理 stride 对齐差异)
-         * 编码器内部 buffer stride 可能对齐到 32/64/128，与 CIM stride(1696) 不同。
-         */
+        /* Step 3: 源 YUV → 编码器 NV12 (逐行拷贝，处理 stride 对齐差异) */
         {
             uint8_t *src_y  = (uint8_t *)cam_buf.img_addr.addr[0];
             uint8_t *src_uv = (uint8_t *)cam_buf.img_addr.addr[1];
@@ -405,10 +417,27 @@ static void *feed_thread(void *arg)
             int w           = cam_buf.img_addr.width;
             int h           = cam_buf.img_addr.height;
 
-            for (int r = 0; r < h; r++)
-                memcpy(dst_y + r * enc_stride, src_y + r * cim_stride, w);
-            for (int r = 0; r < h / 2; r++)
-                memcpy(dst_uv + r * enc_stride, src_uv + r * cim_stride, w);
+            if (ch->is_isp) {
+                /* 前视: ISP NV16 4K → NV12 1080p (软件 nearest 降采样)
+                 *   Y : 水平+垂直 2:1 (3840×2160 → 1920×1080)
+                 *   UV: 水平 2:1 + 垂直 4:1 (NV16 4K UV → NV12 1080p UV)
+                 */
+                for (int r = 0; r < h / 2; r++)
+                    for (int c = 0; c < w / 2; c++)
+                        dst_y[r * enc_stride + c] = src_y[(2 * r) * cim_stride + 2 * c];
+
+                for (int r = 0; r < h / 4; r++)
+                    for (int c = 0; c < w / 4; c++) {
+                        dst_uv[r * enc_stride + 2 * c]     = src_uv[(4 * r) * cim_stride + 4 * c];
+                        dst_uv[r * enc_stride + 2 * c + 1] = src_uv[(4 * r) * cim_stride + 4 * c + 1];
+                    }
+            } else {
+                /* 7~11: CIM NV12(YUV420): Y/UV 直接逐行拷贝 */
+                for (int r = 0; r < h; r++)
+                    memcpy(dst_y + r * enc_stride, src_y + r * cim_stride, w);
+                for (int r = 0; r < h / 2; r++)
+                    memcpy(dst_uv + r * enc_stride, src_uv + r * cim_stride, w);
+            }
         }
 
         in_buf.vframe_buf.pts       = cam_buf.img_info.frame_id;
@@ -421,9 +450,8 @@ static void *feed_thread(void *arg)
         if (!ch->first_frame) {
             ch->first_frame = 1;
             fprintf(stderr,
-                "[FEED   %2d] 首帧: CIM(stride=%u,w=%u,h=%u) → Enc(stride=%d) | "
-                "size[0]=%u size[1]=%u\n",
-                ch->pipe_id,
+                "[FEED   %2d] 首帧: %s(stride=%u,w=%u,h=%u) → Enc(stride=%d) size[0]=%u size[1]=%u\n",
+                ch->pipe_id, ch->is_isp ? "ISP" : "CIM",
                 cam_buf.img_addr.stride_size, cam_buf.img_addr.width, cam_buf.img_addr.height,
                 in_buf.vframe_buf.stride,
                 cam_buf.img_info.size[0], cam_buf.img_info.size[1]);
@@ -434,10 +462,11 @@ static void *feed_thread(void *arg)
         }
 #endif
 
-        /*
-         * Step 4: 归还 CIM buffer。
-         */
-        hb_cam_free_data(ch->cam_port, HB_CAM_YUV_DATA, &cam_buf);
+        /* Step 4: 归还源 buffer */
+        if (ch->is_isp)
+            hb_vio_free_ispbuf(ch->pipe_id, &cam_buf);
+        else
+            hb_cam_free_data(ch->cam_port, HB_CAM_YUV_DATA, &cam_buf);
     }
 
     printf("Pipe %d: feed thread exit\n", ch->pipe_id);
@@ -503,7 +532,8 @@ int main(int argc, char *argv[])
     printf("============================================================\n");
     printf("  J6B VENC Stream — 4-Channel H.264 Encoder + TCP Output\n");
     printf("============================================================\n");
-    printf("  Resolution : %d × %d\n", ENC_WIDTH, ENC_HEIGHT);
+    printf("  Input Resolution : 4k(3940×2160)×1 + 960P(1280×960)×%d\n", CHANNEL_NUM - 1);
+    printf("  Output Resolution : 1080p(1920×1080)×1 + 960P(1280×960)×%d\n", CHANNEL_NUM - 1);
     printf("  Frame rate : %d fps\n", ENC_FPS);
     printf("  Codec      : H.264 CBR %d kbps × %d ch\n",
            ENC_BITRATE, CHANNEL_NUM);
@@ -571,9 +601,12 @@ int main(int argc, char *argv[])
 
     for (int i = 0; i < CHANNEL_NUM; i++) {
         memset(&g_ch[i], 0, sizeof(g_ch[i]));
-        g_ch[i].pipe_id = PIPE_IDS[i];
+        g_ch[i].pipe_id  = PIPE_IDS[i];
         g_ch[i].cam_port = CAM_PORTS[i];
-        g_ch[i].running = 1;
+        g_ch[i].width    = ENC_WIDTHS[i];
+        g_ch[i].height   = ENC_HEIGHTS[i];
+        g_ch[i].is_isp   = IS_ISP[i];
+        g_ch[i].running  = 1;
 
         if (init_encoder(&g_ch[i]) != 0) {
             fprintf(stderr, "FATAL: encoder %d init failed\n", i);

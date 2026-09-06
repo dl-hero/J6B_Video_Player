@@ -1,7 +1,7 @@
 # J6B Video Player — 架构设计文档与使用说明
 
-> **版本**: 1.7.0  
-> **日期**: 2026-08-05  
+> **版本**: 1.9.0  
+> **日期**: 2026-08-10  
 > **适用平台**: Windows 10+ / Ubuntu 22.04+  
 > **目标设备**: J6B (Horizon Robotics J6 芯片平台)  
 > **已验证设备**: J6B_GAC_AY5-TM (IP: 192.168.0.140, 4 路 SC361AT 摄像头)  
@@ -39,7 +39,7 @@
 | | | **`hb_video_client.py`** | **低延迟解码修复**: `decoder.parse()` → `av.Packet(data)` 直送解码器, 消除 PyAV parse 内部缓冲累积(实验验证延迟从几秒降到~200ms)。`thread_count=1` 单线程解码。 |
 | | | **`hb_protocol.py`** | 新增 `CHIP_NAMES = {0:'XJ3',1:'J5',2:'J6B'}` 显示映射字典。 |
 | | | `DESIGN_DOC.md` | 新增第 14 节「问题排查实录」。更新 13.5-13.8 节编译部署参数。 |
-| **1.7.0** | **2026-08-05** | **`venc_stream.c`** | **新增 PYM 消费线程 + FPS 推送线程**: 每路 pipe 独立 `pym_thread` (`hb_vio_get_data(PYM_V3)`→`hb_vio_free_pymbuf`) 驱动 ISP AE/AWB/AF 统计通路, 恢复 R-Core 帧率/3A 统计; `fps_thread` 每秒读 sysfs `/sys/class/misc/port_X/status/fps` → `hb_tool_used_define_pic(type=16)` 推送 5 字节 FPS 到 PC。修复 `run.sh` 中 `exec` 阻断 init.sh 后续启动的问题。 |
+| **1.7.0** | **2026-08-05** | **`venc_stream.c`** | **新增 PYM 消费线程 + FPS 推送线程**: 每路 pipe 独立 `pym_thread` (`hb_vio_get_data(PYM_V3)`→`hb_vio_free_pymbuf`) 驱动 ISP 固件完成 PYM DMA 配置和 sbuf 共享内存通路, 恢复 A 核内 ISP 固件(KF) → libisp_algo(UF) 的 2A(AE/AWB) 统计上报(含帧率 frame_id/timestamp, 经 `/dev/isp_hwX_sbufX` 传递, 不经过 R-Core); `fps_thread` 每秒读 sysfs `/sys/class/misc/port_X/status/fps` → `hb_tool_used_define_pic(type=16)` 推送 5 字节 FPS 到 PC。修复 `run.sh` 中 `exec` 阻断 init.sh 后续启动的问题。 |
 | | | **`hb_video_client.py`** | **新增状态回调框架**: `register_status_callback`/`_notify_status` 支持遥测数据通知; `_recv_loop` 识别 `MESSAGE_CTL_DEFINE_BY_USE(16)` 解析 5 字节 FPS 数据 (`struct.unpack("<5B")`)。 |
 | | | **`hb_video_gui.py`** | **新增「J6B端摄像头帧率」面板**: 右侧独立面板显示 FVC/AVM1-4 实时帧率 (5 行); 顶部控制栏移除摄像头标签。**详情面板优化**: `YUV_DATA`→`NV12_DATA`, `VIDEO_DATA`→`H264_DATA`; 删除无用的「图像格式」「CHN ID」「芯片版本」字段。右侧面板标题「通道信息」→「PC端通道信息」。 |
 | | | **`hb_protocol.py`** | `DataType` 枚举显示名优化: `YUV_DATA(1)`→`NV12_DATA`, `VIDEO_DATA(3)`→`H264_DATA`。 |
@@ -48,6 +48,12 @@
 | | | **`hb_video_gui.py`** | 带宽统计改用 `client.get_stats()['total_bytes']` (实际接收字节数)。 |
 | | | **`CLAUDE.md`** | 更新延迟优化说明、架构描述、H.264 解码路径、线程安全说明。 |
 | | | **`DESIGN_DOC.md`** | 新增第 14.5 节「v1.6.0 调试实录」。更新第 5 节线程模型、第 12 节 H.264 编解码链路、第 14 节问题排查。新增第 9.6 节「生成 Windows 可执行文件 (exe)」— PyInstaller 打包命令与参数说明。 |
+| **1.8.0** | **2026-08-07** | **`DESIGN_DOC.md`** | 新增第 15 节「J6B 设备端工具详解」— camera_sample / display_sample 完整参数表、使用示例、数据流对比、典型配置场景 (DFAC 前视 / GWM DVR 显示器 / venc_stream H.264 编码)。 |
+| **1.9.0** | **2026-08-10** | **`DESIGN_DOC.md`** | 新增第 16 节「BSP 项目目录复制与编译」— 从 BaseSW_J6B_BS 复制到新目录后的编译准备流程、根因分析、自动化脚本 `setup_for_build.sh`。 |
+| | | **`setup_for_build.sh`** | **新增批处理脚本**: 自动清理编译产物、修复路径、补全工具链、生成 Kconfig，一键完成从 BaseSW_J6B_BS 复制后的编译环境准备。 |
+| **1.10.0** | **2026-09-06** | **`venc_stream.c`** | **6路视频 H.264 编码全链路调通**: 前视(ovx8d 4K) + 5路(SC121AT 960P + loopback) 编码传 PC。前视采用「方案 A+C」——ISP DMA 输出 4K NV16 + feed_thread 软件 nearest 降采样到 1080p 再送 VPU，解决单 VPU 4K@60fps 超载(6路全通, 之前只通3路)。`ENC_WIDTHS/ENC_HEIGHTS` per-channel 化, 前视 is_isp 分支 Y 2:1 + UV 2:1/4:1 降采样。 |
+| | | **`vpm_config.json`** | 前视 `isp_dma_output_format=8`(YUV422/NV16) + `buf_num=4` 开启 ISP DMA 输出。 |
+| | | `DESIGN_DOC.md` | 新增第 17 节「6路视频 H.264 编码方案」，含方案 A+C 落地 + 方案 B/D 实施与限制。 |
 
 ---
 
@@ -66,6 +72,10 @@
 11. [附录](#11-附录)
 12. [H.264 编解码链路](#12-h264-编解码链路)
 13. [设备端 venc_stream 工具](#13-设备端-venc_stream-工具)
+14. [问题排查实录](#14-问题排查实录-v150-调试过程)
+15. [J6B 设备端工具详解](#15-j6b-设备端工具详解-camera_sample--display_sample-v180-新增)
+16. [BSP 项目目录复制与编译](#16-bsp-项目目录复制与编译-v190-新增)
+17. [6路视频 H.264 编码方案](#17-6路视频-h264-编码方案-v1100-新增)
 
 ---
 
@@ -728,7 +738,8 @@ while self._running:
 │   │          │          │          │          │              │
 │   │ pym_tid  │ pym_tid  │ pym_tid  │ pym_tid  │ PYM 消费    │
 │   │   ↓      │   ↓      │   ↓      │   ↓      │ (v1.7.0 新增)│
-│   │ PYM→free │ PYM→free │ PYM→free │ PYM→free │ 驱动 ISP 统计│
+│   │ PYM→free │ PYM→free │ PYM→free │ PYM→free │ 驱动 ISP 2A  │
+│   │          │          │          │          │ 统计上报通路 │
 │   └──────────┴──────────┴──────────┴──────────┘              │
 │                                                               │
 │   ┌──────────────────────────────────────────┐               │
@@ -1202,19 +1213,20 @@ python3 -c "import numpy; import cv2; from PIL import Image; import tkinter; pri
 
 **J6B 设备端**:
 
-确保设备端应用程序已集成 `hb_tool_server` 并启动传输。典型方式：
+确保设备端应用程序已集成 `hb_tool_server` 并启动传输。详见 [第 15 节](#15-j6b-设备端工具详解-camera_sample--display_sample-v180-新增)。
+
+典型启动方式：
 
 ```bash
-# 在 J6B 设备上运行 camera_sample (启用 hbplayer 显示传输)
-camera_sample -s 1 -S 0
+# 在 J6B 设备上运行 camera_sample (前视摄像头 → TCP 裸传 PC)
+camera_sample \
+    -c /path/to/hb_j6dev.json \
+    -v /path/to/vpm_config.json \
+    -r 0 -t b22 -s 1 -S 10086
 
-# 或指定端口
-camera_sample -s 1 -S 10086
+# 或使用 venc_stream (H.264 压缩码流, 带宽降低 95%+)
+cd /app/sample/S83_Sample/S83E04_Module/venc_stream/bin && ./run.sh
 ```
-
-关键参数说明：
-- `-s 1`: 启用 hbplayer 显示传输 (`vflow_show = 1`)
-- `-S <port>`: 指定监听端口，0 表示使用默认端口 10086，非 0 时自动启用 `-s 1`
 
 ### 9.2 启动 GUI 版本
 
@@ -1869,3 +1881,527 @@ TCP recv(80B 帧头 + H.264 码流)
 | 长期验证 | 10h | 100.0 fps | 25.0 fps ×4 | 0 | 视频保持同步 |
 
 CPU 占用: i9-13900H 仅用 ~6% (1.2 核/20 核), 任何入门级 CPU 均可满足。内存: <100 MB。
+
+---
+
+## 15. J6B 设备端工具详解 (camera_sample / display_sample) (v1.8.0 新增)
+
+### 15.1 概述
+
+J6B SDK 提供两个关键的视频工具程序，分别服务于不同的调试和验证场景：
+
+| 工具 | 源码路径 | 核心功能 |
+|------|---------|---------|
+| `camera_sample` | `test/samples/.../camera_sample/src/camera_sample.c` (~1650 行) | 摄像头流媒体工具：驱动 VIO 管线 → 读帧 → TCP 裸传到 PC |
+| `display_sample` | `test/samples/.../display_sample/src/display_sample.c` (~1610 行) | IDU 硬件验证工具：驱动 VIO 管线 → IDU → CSI TX → 串行器 → 显示器 |
+
+**两者关系**：功能互补，不是替代关系。在"Camera → ISP → PYM → IDU → 显示器"这一条路径上功能重叠（都由 `hb_vio_init(vpm_config.json)` 驱动硬件管线），但各自有独特能力。
+
+### 15.2 camera_sample
+
+#### 15.2.1 命令行参数
+
+| 参数 | 长选项 | 类型 | 默认值 | 说明 |
+|------|--------|------|--------|------|
+| `-c` | `--cam_config` | string | — | Camera 配置 JSON 路径（`hb_j6dev.json`） |
+| `-v` | `--vio_config` | string | — | VIO 管线配置 JSON 路径（`vpm_config.json`） |
+| `-p` | `--pipe` | int | auto | 指定 pipe 编号 |
+| `-M` | `--mask` | int | auto | pipe 掩码（按位选择启用哪些 pipeline） |
+| `-t` | `--type` | string | `b24` | **数据类型位掩码**，格式 `b#/p#`，`b`=bit, `p`=pipe。位定义见下 |
+| `-d` | `--dump` | flag | 0 | 启用帧 dump 到文件 |
+| `-s` | `--show` | int | 0 | **启用 libhbplayer TCP 传输**，值为帧间隔。需 `ENABLE_HBPLAYER` 编译宏 |
+| `-S` | `--show_port` | int | 10086 | libhbplayer TCP 监听端口 |
+| `-r` | `--run_time` | int | 0 | 运行时长（秒），0=持续运行 |
+| `-l` | `--log` | int | 0 | 日志级别位掩码 |
+| `-e` | `--cam_reset` | string | — | camera 异常复位参数 (mask/time/max) |
+| `-E` | `--diag_event` | flag | 0 | 使能诊断事件回调 |
+
+#### 15.2.2 `-t` 数据类型位定义
+
+| 位值 | 枚举名 | 说明 |
+|------|--------|------|
+| `b7` | `HB_VIO_PYM_DATA` | PYM V1 输出（NV12 像素） |
+| `b11` | `HB_VIO_ISP_YUV_DATA` | ISP YUV 输出 |
+| `b22` | `HB_VIO_PYM_DATA_V3` | **PYM V3 输出（推荐，NV12 像素，`ds_out[0]`）** |
+| `b24` | `HB_VIO_CIM_RAW_DATA` | CIM RAW Bayer 数据（默认） |
+
+> **常用值**：`-t b22` 读取 PYM `ds_out[0]` NV12 数据 → TCP 发送；`-t b22 -s 1` 读 PYM + 启动 TCP server。
+
+#### 15.2.3 典型使用
+
+**场景 1：前视摄像头 → TCP 裸传 NV12 到 PC（DFAC 配置）**
+
+```bash
+camera_sample \
+    -c /app/sample/S83_Sample/S83E04_Module/camera_sample/cfg/case_matrix/DFAC_1V_OVX8D_RX0/hb_j6dev.json \
+    -v /app/sample/S83_Sample/S83E04_Module/camera_sample/cfg/case_matrix/DFAC_1V_OVX8D_RX0/vpm_config.json \
+    -r 0 -t b22 -s 1 -S 10086
+```
+
+数据流：
+```
+ovx8d (3840×2160 RAW12 @30fps)
+  → MIPI CSI-RX (4-lane, rx0)
+  → CIM (vin_node0, flyby=0, LPWM 触发)
+  → ISP (slot 4, sched_mode=1, 4K→NV12)
+  → PYM (pym_mode=1, ds_out[0]=3840×2160 NV12)
+  → CPU 软件读取 → hb_tool_send_yuv_pic()
+  → TCP :10086 → PC 端 (hb_video_client.py, type=1 NV12_DATA)
+```
+
+**场景 2：DVR 模式 — 同时输出显示器 + TCP 到 PC（GWM DVR 配置）**
+
+```bash
+camera_sample \
+    -c /app/sample/S83_Sample/S83E04_Module/camera_sample/cfg/case_matrix/GWM_ovx8d_1v_4k_rx0_cim_isp_pym_idu_tx_tmax96717_DVR/hb_j6dev.json \
+    -v /app/sample/S83_Sample/S83E04_Module/camera_sample/cfg/case_matrix/GWM_ovx8d_1v_4k_rx0_cim_isp_pym_idu_tx_tmax96717_DVR/vpm_config.json \
+    -r 0 -t b22 -s 1 -S 10086
+```
+
+数据流（双路并行）：
+```
+PYM (1920×1080 NV12, ds_out[0])
+  ├── 硬件 bind → IDU → CSI TX → tmax96717_dvr → 外部显示器 (纯硬件，CPU 不参与)
+  └── CPU 软件读取 → hb_tool_send_yuv_pic() → TCP :10086 → PC 端
+```
+
+> **关键**：GWM DVR 的 vpm_config.json 包含 `pym_node0 → idu_node0` 的硬件 bind + `idu_config.json` (含 `board_type=5 TXSER` + `txser0_max96717.json`)。`hb_vio_init()` 自动解析并初始化 IDU 硬件和 tmax96717_dvr 串行器（`dlopen libtxser_adapter.so`），应用层无需额外代码。
+
+### 15.3 display_sample
+
+#### 15.3.1 命令行参数
+
+| 参数 | 长选项 | 类型 | 默认值 | 说明 |
+|------|--------|------|--------|------|
+| `-v` | `--version` | flag | — | 打印版本信息 |
+| `-l` | `--loop` | int | 1 | 循环执行次数 |
+| `-V` | `--vnode_cfg` | string | — | **vnode 配置文件目录**（程序内部拼 `%s/idu_config.json` 和 `%s/vpm_config.json`） |
+| `-D` | `--dump_enable` | int | 0 | 输出 dump 帧数 |
+| `-d` | `--device` | int | 0 | IDU 硬件设备位掩码（可同时选中多个 IDU） |
+| `-P` | `--Plane config` | — | — | 平面配置 |
+| `-p` | `--Pattern` | string | — | 测试图案 YUV 文件路径 |
+| `-M` | `--md5` | flag | 0 | 使能 MD5 校验（对比 golden 参考帧） |
+| `-L` | `--loop_back` | flag | 0 | 回环模式（Camera → IDU → CSI TX → CSI RX 回读） |
+| `-B` | `--vio_bind` | flag | 0 | **VIO bind 使能**（1=硬件管线，0=纯 IDU 测试） |
+| `-s` | `--sensor` | flag | 0 | **是否带 sensor**（`-B 1 -s 1` = 完整 Camera→IDU 管线） |
+| `-T` | `--tims` | int | 10 | 运行时间（秒） |
+| `-m` | `--pipe_mask` | int | 0 | pipeline 掩码（按位选择启用哪些 pipeline） |
+| `-g` | `--debug` | flag | 0 | 使能调试日志 |
+| `-h` | `--help` | flag | — | 打印帮助信息 |
+
+#### 15.3.2 三种工作模式
+
+| 模式 | 参数组合 | 调用函数 | 说明 |
+|------|---------|---------|------|
+| **纯 IDU 模式** | `-B 0` (默认) | `hb_display_sample_work_func()` | 读 YUV 文件 → IDU → CSI TX → 显示器。不依赖 camera/ISP/PYM，独立验证 IDU 硬件 |
+| **PYM→IDU 模式** | `-B 1 -s 0` | `pym_idu_bind_func()` | 本地 YUV 图案喂 PYM → IDU，测试 PYM→IDU 段 |
+| **Camera→IDU 模式** | `-B 1 -s 1` | `camera_vps_idu_bind_func()` | 完整管线：Camera → CIM → ISP → PYM → IDU → CSI TX → 显示器 |
+
+#### 15.3.3 典型使用
+
+**场景 1：纯 IDU 显示测试（YUV 文件 → 显示器）**
+
+```bash
+display_sample -d 1 -l 50000 \
+    -V /app/sample/S83_Sample/S83E04_Module/display_sample/cfg/evm_plus_idu_plane1_nv12_oneshot_csi_1080p_30fps_tmax96717/ \
+    -p /app/sample/S83_Sample/S83E04_Module/display_sample/res/nv16_1920x1080.yuv
+```
+
+> 读取 1920×1080 的 NV16 YUV 文件，oneshot 单帧通过 IDU → CSI TX 输出到显示器。用于验证"IDU 硬件 + 串行器 + 显示器"链路的连通性，不依赖任何 camera/sensor。
+
+**场景 2：回环测试（验证 CSI TX→RX 信号完整性）**
+
+```bash
+display_sample -d 1 -D 5 -l 5 -L 1 -m 3 \
+    -V /app/sample/S83_Sample/S83E04_Module/display_sample/cfg/evm_plus_idu_plane1_nv12_csi_tmax96717_max96724_rx4_1080p_30fps/ \
+    -p /app/sample/S83_Sample/S83E04_Module/display_sample/res/1080p.yuv
+```
+
+> `-D 5` 输出 5 帧，`-L 1` 回环模式，`-l 5` 循环 5 次，`-m 3` 3 路 pipeline。CSITX 输出后从 CSIRX 收回，对比验证信号完整性。
+
+**场景 3：Camera → 显示器（GWM DVR）**
+
+```bash
+display_sample -T 100000000 -m 1 -B 1 -s 1 \
+    -V ../GWM_ovx8d_1v_4k_rx0_cim_isp_pym_idu_tx_tmax96717_DVR/
+```
+
+> `-B 1 -s 1` 完整 Camera→IDU 管线，`-T 100000000` ≈ 永不停止，`-m 1` 仅 pipeline 0。`-V` 目录需含 `vpm_config.json` + `idu_config.json` + `txser0_max96717.json`。
+
+### 15.4 功能对比总表
+
+| 功能 | camera_sample | display_sample |
+|------|:---:|:---:|
+| Camera → ISP → PYM → IDU → 显示器 | ✅ (配置含 idu_node0) | ✅ (`-B 1 -s 1`) |
+| PYM → IDU（无 camera, YUV 文件） | ❌ | ✅ (`-B 1 -s 0`) |
+| 纯 IDU 显示测试（YUV 文件 → IDU） | ❌ | ✅ (`-B 0 -p file.yuv`) |
+| Loopback 回环测试 | ❌ | ✅ (`-L 1`) |
+| Oneshot 单帧显示 | ❌ | ✅ (`-d 1 -l N`) |
+| MD5 自动化校验 | ❌ | ✅ (`-M`) |
+| 多 IDU 设备选择（位掩码） | ❌ | ✅ (`-d`) |
+| **读帧 + TCP 裸传到 PC** | ✅ (`-s 1 -t b22`) | ❌ |
+| 帧 dump 到文件 | ✅ (`-d`) | ✅ (`-D`) |
+| 多数据类型读取 (CIM RAW / ISP YUV / PYM) | ✅ (`-t`) | ❌ |
+| Camera 异常恢复 | ✅ (`-e`) | ❌ |
+
+### 15.5 IDU / 串行器初始化机制
+
+**关键结论**：IDU 硬件和串行器（如 tmax96717、tmax96717_dvr）的初始化**不是 display_sample 独有的**。只要 vpm_config.json 包含 `idu_node0`，`hb_vio_init()` 内部会自动完成全部初始化。
+
+调用链：
+
+```
+hb_vio_init("vpm_config.json")
+  └─ hb_vpm_init()
+     └─ 解析 vpm_config.json → 发现 idu_node0
+        └─ idu_vnode_cfg_init()                       hbn_idu_vnode.c
+           ├─ idu_node_parser_config()
+           │   └─ 读取 "cfg_file": "./idu_config.json"
+           │      └─ 解析 outputconfig.board
+           │         board_type=5 (TXSER)
+           │         └─ dlopen("libtxser_adapter.so")
+           │            └─ hbn_txser_adapter_cfg_init() 解析 txser0_max96717.json
+           │
+           └─ idu_vnode_init()                        启动 pipeline 时调用
+              ├─ 打开 IDU DRM 设备
+              ├─ 配置 CSI TX (lanes, mipiclk, datatype)
+              └─ board_type==TXSER
+                  └─ hbn_disp_txser_init()
+                     → 硬件初始化 tmax96717/tmax96717_dvr 串行器
+```
+
+因此，camera_sample 使用含 `idu_node0` 的 vpm_config.json 时，同样能驱动 IDU 和串行器。这也意味着 GWM DVR 配置用 camera_sample 启动，可以**同时**获得显示器输出（硬件 bind）和 TCP 流（软件读取），无需 display_sample。
+
+### 15.6 典型配置场景速查
+
+#### 15.6.1 DFAC 前视（ovx8d, 4K, 仅 TCP 传 PC）
+
+| 项目 | 值 |
+|------|-----|
+| 工具 | camera_sample |
+| 配置文件 | `case_matrix/DFAC_1V_OVX8D_RX0/` |
+| Sensor | ovx8dstd, 3840×2160, 30fps, 4-lane MIPI |
+| 管线 | CIM(flyby=0) → ISP(slot 4) → PYM(mode=1) |
+| PYM 输出 | ds_out[0] = 3840×2160 (全分辨率) |
+| 到 PC 数据 | NV12 原始像素, ~12.4 MB/帧, ~373 MB/s |
+| 无 IDU/串行器 | 纯软件读帧 + TCP |
+
+#### 15.6.2 GWM DVR（ovx8d, 1080p, 显示器 + TCP 双路）
+
+| 项目 | 值 |
+|------|-----|
+| 工具 | camera_sample (推荐) 或 display_sample |
+| 配置文件 | `case_matrix/GWM_ovx8d_1v_4k_rx0_cim_isp_pym_idu_tx_tmax96717_DVR/` |
+| Sensor | ovx8dstd, 3840×2160, 30fps, 4-lane MIPI, extra_mode=12 |
+| 管线 | CIM(flyby=0, LPWM 触发) → ISP(slot 4) → PYM(mode=1) |
+| PYM 输出 | ds_out[0] = 1920×1080 (缩放到 1080p), 6 个 ds_roi |
+| **显示器路径** | PYM → IDU(hardware bind) → CSI TX 2-lane → tmax96717_dvr |
+| **TCP 路径** | PYM ds_out[0] CPU 读取 → NV12 裸传, ~3.1 MB/帧, ~93 MB/s |
+| 串行器差异 | `tmax96717_dvr`（非普通 `tmax96717`），gpio_pin [487,490] |
+
+#### 15.6.3 venc_stream（SC361AT ×4, H.264 编码, 仅 TCP）
+
+| 项目 | 值 |
+|------|-----|
+| 工具 | venc_stream (独立程序) |
+| 配置文件 | `case_matrix/GAC_BYPASS_TEST_4V_SC361ATSTD_1696x1168_RSEMI_RX4/` |
+| Sensor | SC361AT ×4, 1696×1168, 30fps |
+| 管线 | CIM(ddr_enable=1) → DDR → VPU Encoder ×4 |
+| 到 PC 数据 | H.264 压缩码流, 4 Mbps/路, 总 ~16 Mbps |
+| PC 端解码 | `decoder.parse()` → PyAV 解码 → BGR |
+
+#### 15.6.4 三条路径数据流对比图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  【Path A: DFAC 前视 (camera_sample, 仅 TCP)】                       │
+│  ovx8d → CIM → ISP → PYM(ds_out[0]=4K)                              │
+│                        │                                             │
+│                        └── CPU read → hb_tool_send_yuv_pic()        │
+│                                       → TCP :10086 → PC             │
+├─────────────────────────────────────────────────────────────────────┤
+│  【Path B: GWM DVR (camera_sample, 显示器 + TCP 双路)】               │
+│  ovx8d → CIM → ISP → PYM(ds_out[0]=1080p)                           │
+│                        │                                             │
+│                        ├── HW bind → IDU → CSI TX → tmax96717_dvr   │
+│                        │              → 外部显示器                    │
+│                        │                                             │
+│                        └── CPU read → hb_tool_send_yuv_pic()        │
+│                                       → TCP :10086 → PC             │
+├─────────────────────────────────────────────────────────────────────┤
+│  【Path C: venc_stream (VPU 编码, 仅 TCP)】                           │
+│  SC361AT×4 → CIM → DDR → VPU Encoder(H.264 CBR 4Mbps)               │
+│                            │                                         │
+│                            └── hb_tool_send_video_pic()             │
+│                                → TCP :10086 → PC(PyAV 解码)          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 15.7 设备端配置文件说明
+
+每个配置场景（case_matrix 子目录）通常包含以下文件：
+
+| 文件 | 用途 | 必需 |
+|------|------|:---:|
+| `hb_j6dev.json` | Camera/Sensor 配置（sensor 型号、分辨率、fps、MIPI lane、deserial） | ✅ |
+| `vpm_config.json` | **VIO 管线拓扑**（CIM→ISP→PYM→[IDU] 的 bind 关系 + 各节点参数） | ✅ |
+| `idu_config.json` | IDU 显示输出配置（输入/输出分辨率、CSI TX、串行器引用）。仅 display_sample / DVR 模式需要 | 条件 |
+| `txser0_max96717.json` | 串行器配置（型号、I2C 地址、lane 模式、GPIO） | 条件 |
+| `lpwm_rx0.json` | LPWM 触发配置（周期、偏移、占空比）。用于帧同步 | 可选 |
+| `display_sample.sh` | display_sample 的 shell 启动脚本（含各 case 的完整命令行） | 可选 |
+
+> GWM DVR 配置含全部 6 个文件；DFAC 前视配置不含 `idu_config.json` 和 `txser0_max96717.json`（不走 IDU/显示器路径）。
+
+---
+
+## 16. BSP 项目目录复制与编译 (v1.9.0 新增)
+
+### 16.1 背景
+
+在实际开发中，经常需要从 `BaseSW_J6B_BS`（已验证可编译通过的 BSP 基线）复制一份到新目录（如 `BaseSW_J6B_BS_ChinaFAN_SAIC_AUX_SAIC_J6B`），在新目录中独立编译。然而直接 `cp -r` 后运行 `bdall` 会遇到一系列编译错误。
+
+**根因**：`BaseSW_J6B_BS` 是 Google `repo` 工具管理的多仓库超级项目，`cp -r` 复制会带入两类问题：
+1. **编译中间产物**含旧目录的绝对路径
+2. **工具链文件**在复制过程中丢失（嵌套 git 仓库的文件未完整复制）
+
+### 16.2 项目仓库结构
+
+`BaseSW_J6B_BS` 并非普通 git 仓库，而是 `repo` 工具管理的多仓库集合：
+
+```
+BaseSW_J6B_BS/
+├── .repo/                    # repo 工具元数据（manifest、projects）
+├── build_tools/
+│   ├── Compiler/             # 独立 git 仓库 — QNX 8.0.0 工具链 (~4.0G)
+│   ├── hobot_tools/          # 独立 git 仓库 — 编译脚本（build.sh 等）
+│   └── kbuild_tools/         # Kconfig 构建工具
+├── hardware/
+│   └── minsys-qnx/prebuilt/  # 预编译 QNX 库
+├── install/                  # 预编译安装文件 (~1.4G)
+├── prebuilt/                 # 预编译工具链和库 (~327M)
+├── out/                      # 编译输出目录（含 .config、.dep、.o 等生成物）
+└── build.sh → build_tools/... # 相对路径符号链接（安全）
+```
+
+> **关键事实**：源码和构建脚本中**零硬编码路径**。`build.sh` 使用 `HR_TOP_DIR=$(pwd)` 动态获取当前目录，`envsetup.sh` 同样使用绝对路径的动态变量。所有问题均来自**生成产物**和**复制丢失**。
+
+### 16.3 复制后编译失败的原因分类
+
+#### 类别 A：`.config` 中的 QNX 工具链绝对路径
+
+`out/.config` 是 `make menuconfig` 生成的核心配置文件，包含 3 行 QNX 工具链绝对路径：
+
+```bash
+export QNX_HOST=/旧目录/build_tools/Compiler/qnx800/host/linux/x86_64
+export QNX_TARGET=/旧目录/build_tools/Compiler/qnx800/target/qnx
+export MAKEFLAGS=-I/旧目录/build_tools/Compiler/qnx800/target/qnx/usr/include
+```
+
+如果不修复，`envsetup.sh` source `.config` 后会设置错误的 QNX 环境变量。
+
+#### 类别 B：源码树中的编译中间产物
+
+QNX 编译器在源码树中生成了大量依赖文件，内含旧绝对路径（约 3500+ 文件）：
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| `*.dep` | QNX `qcc` make 依赖文件 | `hardware/basesys-qnx/sysfs/aarch64/so.le/compat_string.dep` 内部引用 `/旧目录/.../compat_string.c` |
+| `*.o` | 编译目标文件 | 同样可能含路径引用 |
+| `*.pinfo` | QNX 包信息文件 | 无硬编码路径但属于生成产物，应清理 |
+
+典型错误信息：
+```
+make[2]: *** No rule to make target '/旧目录/.../compat_string.c',
+needed by 'compat_string.o'. Stop.
+```
+
+Docker 容器内只挂载了当前项目目录，旧目录不存在，导致 make 报错。
+
+#### 类别 C：`out/` 目录中的生成文件
+
+`out/` 目录下有大量包含旧路径的生成产物：
+
+| 文件类型 | 数量 | 说明 |
+|---------|------|------|
+| `out/.config` | 1 | QNX 路径错误（同类别 A） |
+| `out/debug-qnx-64/build/*/Makefile` | 3 | `-C /旧目录/...` 编译指令 |
+| 绝对路径符号链接 | 5 | `out/host/kbuild_tools/source → /旧目录/...` |
+| `*.d` / `*.cmd` | ~2700 | GCC/kbuild 依赖与命令记录 |
+| `*.json` | 16 | 部署镜像描述文件 |
+| `*.log` | ~2400 | 旧编译日志 |
+
+解决方式：**直接删除整个 `out/` 目录**，重新生成。
+
+#### 类别 D：工具链文件复制丢失
+
+`build_tools/Compiler/` 和 `out/host/toolchain/` 是独立 git 仓库，`cp -r` 可能因权限、符号链接、嵌套 `.git` 等原因丢失文件：
+
+| 缺失内容 | 大小差 | 导致错误 |
+|---------|--------|---------|
+| `crti.o`, `crtn.o`, `crtbegin.o`, `crtend.o` | ~800KB | `ld: cannot find crti.o` |
+| `.a` 静态库 (30 个) | ~30MB | `No rule to make target 'libqh.a'` |
+| `liblto_plugin.so` | ~1MB | `gcc: fatal error: liblto_plugin.so not found` |
+| `libqh.so` 符号链接 | — | 链接器找不到 QNX 系统库 |
+
+验证方法：对比原目录的 `du -sh` 大小。
+
+### 16.4 标准操作流程
+
+```bash
+# 1. 从 BaseSW_J6B_BS 复制到新目录
+cp -r /media/jinnuo/work/SourceCode/HR-J6B/BaseSW_J6B_BS \
+      /media/jinnuo/work/SourceCode/HR-J6B/新项目名称
+
+# 2. 进入新目录，执行准备脚本
+cd /media/jinnuo/work/SourceCode/HR-J6B/新项目名称
+bash setup_for_build.sh
+
+# 3. 加载环境并编译
+source envsetup.sh
+bdall    # 等同于 build.sh docker all
+```
+
+### 16.5 `setup_for_build.sh` 脚本说明
+
+脚本位置：`<项目根目录>/setup_for_build.sh`
+
+```bash
+#!/bin/bash
+# setup_for_build.sh — BSP 项目复制后的编译环境准备
+# 用法: cd 新项目目录 && bash setup_for_build.sh
+set -e
+
+ORIGINAL_DIR="/media/jinnuo/work/SourceCode/HR-J6B/BaseSW_J6B_BS"
+TARGET_DIR="$(pwd)"
+
+# [1/5] 清理源码树中的编译中间产物
+find . -path "*/.git" -prune -o -name "*.dep"   -delete 2>/dev/null || true
+find . -path "*/.git" -prune -o -name "*.o"     -delete 2>/dev/null || true
+find . -path "*/.git" -prune -o -name "*.pinfo" -delete 2>/dev/null || true
+
+# [2/5] 删除并重建 out/
+rm -rf out/ && mkdir -p out
+
+# [3/5] 从原项目复制 .config 并 sed 替换 QNX 路径
+cp "${ORIGINAL_DIR}/out/.config" out/.config
+sed -i "s|${ORIGINAL_DIR}|${TARGET_DIR}|g" out/.config
+
+# 创建 out/.env（gen_kconfigs 需要）
+cat > out/.env << EOF
+export BoardConfig=j6b_debug_defconfig_SAIC
+export CHIP_DIR=j6
+export REL_CHIP=j6b
+EOF
+
+# [4/5] rsync 补全工具链（仅传输缺失/不同的文件）
+rsync -a "${ORIGINAL_DIR}/build_tools/Compiler/qnx800/" \
+           "${TARGET_DIR}/build_tools/Compiler/qnx800/"
+rsync -a "${ORIGINAL_DIR}/out/host/toolchain/" \
+           "${TARGET_DIR}/out/host/toolchain/"
+rsync -a "${ORIGINAL_DIR}/install/"  "${TARGET_DIR}/install/"
+rsync -a "${ORIGINAL_DIR}/prebuilt/" "${TARGET_DIR}/prebuilt/"
+rsync -a "${ORIGINAL_DIR}/hardware/minsys-qnx/prebuilt/" \
+           "${TARGET_DIR}/hardware/minsys-qnx/prebuilt/"
+
+# [5/5] 生成 Kconfig 文件
+source envsetup.sh && make gen_kconfigs
+```
+
+### 16.6 编译失败问题速查表
+
+| 错误信息 | 原因类别 | 修复 |
+|---------|---------|------|
+| `No rule to make target '.../旧目录/.../xxx.c'` | B — `.dep` 文件含旧路径 | 删除 `*.dep` |
+| `cannot find crti.o / crtbegin.o / crtend.o / crtn.o` | D — QNX CRT 文件缺失 | rsync 同步 Compiler/qnx800 |
+| `No rule to make target 'libqh.a'` | D — QNX 系统库缺失 | rsync 同步 Compiler/qnx800 |
+| `fatal error: liblto_plugin.so not found` | D — Host 工具链缺失 | rsync 同步 out/host/toolchain |
+| `Please to run make menuconfig !!!` | A — `.config` 路径错误 / MENUCONFIG_ENVSETUP 未设置 | 先 `source envsetup.sh` 再 `bdall` |
+| `KconfigError: 'out/generated_kconfigs/vendor_Kconfig' not found` | — `out/.env` 缺失或 gen_kconfigs 未执行 | 创建 `out/.env` + `make gen_kconfigs` |
+| `No rule to make target 'libgtest.a'` | D — 预编译库缺失 | rsync 同步 install/ 和 prebuilt/ |
+
+### 16.7 核心设计原则
+
+1. **不要删除预编译目录**：`install/`、`prebuilt/`、`hardware/*/prebuilt/` 下的 `.so` 和 `.a` 是**源码的一部分**，不能作为"编译中间产物"清理
+2. **删 out/ 整目录最安全**：`out/` 中所有文件都是生成的，删除后编译系统会完整重建
+3. **rsync 不用 `--ignore-existing`**：工具链目录中同名文件可能内容相同但不同（如权限位），用不带 `--ignore-existing` 的 rsync 可确保完全一致
+4. **`.config` 路径用 sed 修复**：`make menuconfig` 可重新生成但需要交互操作，sed 更自动化
+5. **OEM 配置通过 defconfig 决定**：`BOARD_CONFIG=j6b_debug_defconfig_SAIC` 在 `.config` 中，如需修改 OEM（如 GAC → SAIC），应先修改 `out/.env` 再重新 `make menuconfig`
+
+---
+
+## 17. 6路视频 H.264 编码方案 (v1.10.0 新增)
+
+### 17.1 背景：6 路编码超载
+
+6 路视频（1×前视 ovx8d 4K + 4×SC121AT 960P + 1×loopback）编码传 PC。
+
+**VPU 编码上限**（`document/cn/html/j6_media_debug/video/j6_media_debug_codec_debug_hw_overview.html` 7.1.1 节「VPU硬件特性」）：
+
+| 项 | 值 |
+|---|---|
+| HW number（VPU 硬件单元数） | 1 |
+| performance（总编码吞吐） | **4K@60fps** ≈ 498M 像素/秒 |
+| max instance | 32 |
+
+6 路负载 = 1×4K@30(249M) + 5×960P@30(184M) = **433M 像素/秒 ≈ 87% 峰值**，加上 4K 编码非纯线性开销，实测超载。
+
+**超载现象**：只通 3 路（ch0/7/9），ch8/10/11 编码 task 启动后立即挂掉——`output size=0`（stream_end）+ `dequeue input fail(-268435455 / 0xF0000001)`，其中 `0xF0000001 = HB_MEDIA_ERR_UNKNOWN`（`hb_media_error.h:38`）。
+
+### 17.2 前视数据流与两条硬约束
+
+前视 ovx8d 是 4K RAW12 sensor，数据流（`vpm_config.json` pipeline0）：
+
+```
+sensor 4K RAW ──> CIM ROI 通道(ch4, M2M DDR 中转) ──> ISP ─┬─stream输出─> PYM ─> IDU (DVR)
+                                                            └─DMA输出 4K NV16 ─> 编码
+```
+
+两条硬约束（决定方案取舍）：
+
+1. **ISP 三方标定要求原 RAW**：前视 ISP 是三方调参的，必须吃原始 4K RAW，不能在 CIM 端压缩（否则破坏 Bayer 结构和三方标定基准）。
+2. **前视 PYM 被 IDU 占用**：前视要做 DVR（`pym_node0 → idu_node0` bind），PYM 的 buffer 会被 IDU 硬件流转，不能同时软件读 PYM 编码（双消费冲突）。
+
+### 17.3 方案 A+C（最终采用）
+
+**思路**：编码走 ISP 的 DMA 输出（4K NV16，方案 A），feed_thread 软件 nearest 降采样到 1080p 再送 VPU（方案 C）。ISP 侧全链路不动，只改 venc_stream。
+
+**变更点（只改 `venc_stream.c`）**：
+
+1. 编码分辨率 per-channel：`ENC_WIDTHS[0]=1920`、`ENC_HEIGHTS[0]=1080`（其余 5 路 960P 不变）。
+2. feed_thread 前视 `is_isp` 分支降采样（NV16 4K → NV12 1080p）：
+   - Y：水平+垂直 2:1（3840×2160 → 1920×1080）
+   - UV：水平 2:1 + 垂直 4:1（NV16 4K UV → NV12 1080p UV）
+3. `vpm_config.json` 保持 `isp_dma_output_format=8`(YUV422/NV16) + `buf_num=4`。
+
+**数据流**：
+
+```
+ISP ──DMA 4K NV16──> feed_thread 软件降采样 1080p NV12 ──> VPU 编码 1080p ──> TCP PC
+  └──stream──> PYM(1080p) ──> IDU ──> DVR (不受影响)
+```
+
+**验证结果**：6 路全通，`[STAT] ch0~ch11` 全部 `err=0`、`feed=out`。前视 log：`[FEED 0] 首帧: ISP(stride=3840,w=3840,h=2160) → Enc(stride=1920)`（源 4K NV16、编码器 1080p）。CPU 开销：前视降采样线程约 3% 单核（nearest 纯字节拷贝，远低于预估 20~40%）。
+
+### 17.4 方案 B（CIM rawds，未采用）
+
+**思路**：CIM `rawds_en=1` 从源头把 4K RAW 压到 1080p（固定 1/2，2×2 Bayer binning），全链路降载（省 ISP/DDR/VPU 全部负载，零 CPU）。
+
+**实施**：`vin_node0.cim.output.cim_isp.rawds.rawds_en=1`（`rawds_mode=0` 用 9331 加权核 / `=1` 用 4444 平均核）。缩放比例固定 1/2，不可配置（寄存器只有 `RAW_SCALER_EN` 使能位 + 4 个权重 G0~G3，无缩放比例位；`hobot_cim_ops.c:666-668` 的 `width/2` 印证）。
+
+**限制（不可行）**：rawds 会改变 RAW 的 Bayer 结构和像素值，而前视 ISP 是三方标定、要求**原始 4K RAW**，因此方案 B 会破坏三方调参基准，不可采用。
+
+### 17.5 方案 D（PYM BL 下采样，未采用）
+
+**思路**：PYM DS 层 `sel=0` 直接 1/2 下采样到 1080p NV12（`ds_roi[0]` 的 out 改 1920×1080），软件读 `ds_out[0]` 编码。零 CPU、格式天然 NV12（`pym_get_ds_format` 恒返回 `MEM_PIX_FMT_NV12`），无需 NV16→NV12 降采样。
+
+**实施**：`pym_node0.chn.ds_roi[0]` 的 `ds_roi_out_width/height` 改 1920×1080（sel 保持 0，DS 层自带 ratio(1/2,1] 缩放，**无需 BL 层**；GWM DVR 配置已验证此路）。
+
+**限制（不可行）**：前视 PYM 会被 IDU bind（`pym_node0 → idu_node0`，`layer_num_trans_next` 选 layer 走 M2M 流转给 IDU）；若软件同时读 PYM 编码，会双消费冲突（丢帧/2A 停）。
+
+### 17.6 方案对比总结
+
+| 方案 | 下采样点 | CPU | 影响范围 | 结果 |
+|---|---|---|---|---|
+| **A+C（采用）** | 软件 feed_thread | ~3% 单核 | 只影响编码 | ✅ 6 路全通 |
+| B（rawds） | CIM 硬件 | 零 | 全链路 RAW（破坏三方标定） | ❌ ISP 需原 RAW |
+| D（PYM） | PYM 硬件 | 零 | 只影响编码 | ❌ IDU 占用 PYM |
