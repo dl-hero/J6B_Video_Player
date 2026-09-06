@@ -53,7 +53,7 @@
 | | | **`setup_for_build.sh`** | **新增批处理脚本**: 自动清理编译产物、修复路径、补全工具链、生成 Kconfig，一键完成从 BaseSW_J6B_BS 复制后的编译环境准备。 |
 | **1.10.0** | **2026-09-06** | **`venc_stream.c`** | **6路视频 H.264 编码全链路调通**: 前视(ovx8d 4K) + 5路(SC121AT 960P + loopback) 编码传 PC。前视采用「方案 A+C」——ISP DMA 输出 4K NV16 + feed_thread 软件 nearest 降采样到 1080p 再送 VPU，解决单 VPU 4K@60fps 超载(6路全通, 之前只通3路)。`ENC_WIDTHS/ENC_HEIGHTS` per-channel 化, 前视 is_isp 分支 Y 2:1 + UV 2:1/4:1 降采样。 |
 | | | **`vpm_config.json`** | 前视 `isp_dma_output_format=8`(YUV422/NV16) + `buf_num=4` 开启 ISP DMA 输出。 |
-| | | `DESIGN_DOC.md` | 新增第 17 节「6路视频 H.264 编码方案」，含方案 A+C 落地 + 方案 B/D 实施与限制。 |
+| | | `DESIGN_DOC.md` | 新增第 17 节「6路视频 H.264 编码方案」(含方案 A+C 落地 + 方案 B/D 实施与限制)、第 18 节「venc_stream 移植 checklist」(含硬编码项自动获取标注)。 |
 
 ---
 
@@ -76,6 +76,7 @@
 15. [J6B 设备端工具详解](#15-j6b-设备端工具详解-camera_sample--display_sample-v180-新增)
 16. [BSP 项目目录复制与编译](#16-bsp-项目目录复制与编译-v190-新增)
 17. [6路视频 H.264 编码方案](#17-6路视频-h264-编码方案-v1100-新增)
+18. [venc_stream 移植 checklist](#18-venc_stream-移植-checklist-v1100-新增)
 
 ---
 
@@ -2405,3 +2406,84 @@ ISP ──DMA 4K NV16──> feed_thread 软件降采样 1080p NV12 ──> VPU 
 | **A+C（采用）** | 软件 feed_thread | ~3% 单核 | 只影响编码 | ✅ 6 路全通 |
 | B（rawds） | CIM 硬件 | 零 | 全链路 RAW（破坏三方标定） | ❌ ISP 需原 RAW |
 | D（PYM） | PYM 硬件 | 零 | 只影响编码 | ❌ IDU 占用 PYM |
+
+---
+
+## 18. venc_stream 移植 checklist (v1.10.0 新增)
+
+### 18.1 前置判定（决定走哪条路线）
+
+| # | 检查项 | 结论 |
+|---|---|---|
+| 0.1 | 目标板端 sensor/serdes 型号是否与源板端一致？ | 是 → 同硬件（阶段 2/4/5）；否 → 跨硬件（全阶段） |
+| 0.2 | 目标板端 SDK 版本是否与编译环境一致？ | 不一致 → 必须重新编译 |
+| 0.3 | 数据通路结构（RAW/YUV、分辨率、通道数、port 编号）是否一致？ | 不一致 → 改硬编码 + 重编译 |
+
+### 18.2 移植 checklist
+
+**阶段 1：代码侧（仅「结构变化」或「跨硬件」需要）**
+
+- [ ] 核对 `venc_stream.c` 硬编码：`CHANNEL_NUM`(37) / `PIPE_IDS`(47) / `CAM_PORTS`(50) / `ENC_WIDTHS/ENC_HEIGHTS`(53-54) / `IS_ISP`(57)
+- [ ] 前视降采样逻辑（feed_thread `is_isp` 分支）与分辨率是否匹配
+- [ ] 重新编译：`cd <SDK>/tools/viotool/venc_stream/src && source build_tools/Compiler/qnx800/qnxsdp-env.sh && source envsetup.sh && make clean && make && cp venc_stream ../bin/`
+
+**阶段 2：配置侧（两路线都需要）**
+
+- [ ] `vpm_config.json`：pipeline 结构、前视 `isp_dma_output_format=8`+`buf_num=4`、PYM ds_roi
+- [ ] `hb_j6dev.json`：sensor_name / deserial_name / port 映射 / 分辨率 / fps
+- [ ] `lpwm_rx4.json`、`hb_mipi_*.json`
+- [ ] 4 个文件放到 `camera_sample/cfg/case_matrix/<新配置目录>/`
+
+**阶段 3：驱动侧（仅「跨硬件」需要）**
+
+- [ ] sensor tuning 库（`/usr/hobot/lib/sensor/` 下对应 `config_index` 的 `.so`）
+- [ ] serdes 驱动（libcam 内有新解串器型号）
+- [ ] 目标板端已 `bdall <OEM>` 烧录完整 SDK（含驱动 + venc_stream 依赖 `.so`）
+
+**阶段 4：部署（两路线都需要）**
+
+- [ ] scp `venc_stream` 二进制 + 启动脚本 → `/app/sample/S83_Sample/S83E04_Module/venc_stream/bin/`
+- [ ] 改脚本 `CFG_BASE` 指向新配置目录（`run_forBaic6V.sh:21`）
+- [ ] 改 `/app/init.sh` OEM 分支调用正确脚本
+- [ ] 确认可执行权限（`chmod +x`）
+
+**阶段 5：验证**
+
+- [ ] `Starting pipeline 0/7/8/9/10/11 ... OK`
+- [ ] `hb_cam_init() OK`
+- [ ] `[FEED 0] 首帧: ISP(stride=3840,w=3840,h=2160)`
+- [ ] `[STAT] ch0~ch11` 全部 `err=0`
+- [ ] PC 端 6 路显示 + 长时间运行无 err 增长
+
+### 18.3 硬编码项的可自动获取性标注（减少 checklist 的优化方向）
+
+| 硬编码项 | 能否自动获取 | 获取方式 | 能否减掉 checklist |
+|---|---|---|---|
+| `CHANNEL_NUM` | ✅ | 解析 `vpm_config.json` 顶层 pipeline 数量 | ✅ |
+| `PIPE_IDS[]` | ✅ | 解析 `vpm_config.json` 顶层 `pipelineX` 的 X | ✅ |
+| `CAM_PORTS[]` | ✅ | 解析 `hb_j6dev.json` 顶层 `port_X` 的 X | ✅ |
+| `IS_ISP[]` | ✅ | 有无 `isp_node0` / `hb_vio_get_param(HB_VIO_ISP_BUF_INFO)` 探测 | ✅ |
+| `ENC_WIDTHS/HEIGHTS[]` | ⚠️ 部分 | 源分辨率可获取（`isp_node0.width/height`、`cim.mipi.width/height`），编码分辨率 = 源 × 降采样比例 | ⚠️ |
+
+**关键拆解**：`ENC_WIDTHS/HEIGHTS` 混了两个概念：
+
+```
+编码分辨率 = 源分辨率（可自动获取） × 降采样比例（设计决策，需约定）
+```
+
+| 通道 | 源分辨率（json 可取） | 降采样比例 | 编码分辨率 |
+|---|---|---|---|
+| 前视 | `isp_node0.width/height` = 3840×2160 | 1/2（约定） | 1920×1080 |
+| 7~11 | `cim.mipi.width/height` = 1280×960 | 1/1 | 1280×960 |
+
+**优化方向（后续讨论）**：引入 cJSON 解析 `vpm_config.json` + `hb_j6dev.json`，启动时自动获取 `CHANNEL_NUM/PIPE_IDS/CAM_PORTS/IS_ISP/源分辨率`，降采样比例作为唯一配置项（或约定「ISP 路固定 1/2」）。这样移植时「改硬编码 + 重编译」一步消失。
+
+### 18.4 常见坑速查
+
+| 现象 | 原因 | 排查 |
+|---|---|---|
+| `hb_cam_init() fail` | sensor/serdes 驱动缺失 | 检查 `/usr/hobot/lib/sensor/` + libcam serdes 驱动 |
+| `Starting pipeline X ... FAIL` | pipeline/port 编号不对 | 核对 `PIPE_IDS` 与 `vpm_config.json` |
+| 某路取不到数据、`err` 涨 | `CAM_PORTS`/`IS_ISP` 不匹配 | 核对 port 映射 + RAW/YUV 标记 |
+| 花屏/分辨率错乱 | `ENC_WIDTHS/HEIGHTS` 不符 | 核对每通道分辨率 |
+| 启动即段错误 | SDK 版本不一致 | 用目标 SDK 重新编译 |
